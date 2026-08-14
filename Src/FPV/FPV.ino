@@ -1,5 +1,7 @@
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
 
 #define PWDN_GPIO_NUM  -1
 #define RESET_GPIO_NUM -1
@@ -19,29 +21,247 @@
 #define HREF_GPIO_NUM  47
 #define PCLK_GPIO_NUM  13
 
-// ===========================
-// Enter your WiFi credentials
-// ===========================
-const char *ssid = "FPV";
-const char *password = "";
+const char *defaultSsid = "Redmi_0DAC";
+const char *defaultPassword = "16716811";
+const char *hostname = "fpv-car";
+const char *preferencesNamespace = "fpv-wifi";
+const uint32_t wifiConnectTimeoutMs = 20000;
 
 // GPIO Setting
 // Change according to your setup
-extern int gpLb =  D1; // Left 1
-extern int gpLf = D2; // Left 2
-extern int gpRb = D3; // Right 1
-extern int gpRf = D4; // Right 2
-extern int gpLed = D9 ; // Light
-extern int gpGND = D8 ; // Light
-extern String WiFiAddr = "192.168.4.1";
+int gpLb = D1; // Left 1
+int gpLf = D2; // Left 2
+int gpRb = D3; // Right 1
+int gpRf = D4; // Right 2
+int gpLed = D9; // Light
+int gpGND = D8; // Light
+String WiFiAddr;
+String wifiSsid;
+String wifiPassword;
+
+enum SerialConfigState {
+  SERIAL_COMMAND,
+  SERIAL_WIFI_SSID,
+  SERIAL_WIFI_PASSWORD
+};
+
+SerialConfigState serialConfigState = SERIAL_COMMAND;
+String serialLine;
+String pendingWifiSsid;
+bool mdnsStarted = false;
+bool wifiWasConnected = false;
+bool cameraAvailable = false;
 
 void startCameraServer();
+void serviceDriveWatchdog();
+void serviceSerialConfiguration();
+void WheelAct(int nLf, int nLb, int nRf, int nRb);
 // void setupLedFlash(int pin);
+
+void loadWiFiCredentials() {
+  Preferences preferences;
+  if (!preferences.begin(preferencesNamespace, true)) {
+    wifiSsid = defaultSsid;
+    wifiPassword = defaultPassword;
+    return;
+  }
+
+  wifiSsid = preferences.getString("ssid", defaultSsid);
+  wifiPassword = preferences.getString("password", defaultPassword);
+  preferences.end();
+}
+
+bool saveWiFiCredentials(const String &ssid, const String &password) {
+  Preferences preferences;
+  if (!preferences.begin(preferencesNamespace, false)) {
+    return false;
+  }
+  bool saved = preferences.putString("ssid", ssid) == ssid.length();
+  saved = preferences.putString("password", password) == password.length() && saved;
+  preferences.end();
+  return saved;
+}
+
+void printWiFiStatus() {
+  Serial.printf("Configured SSID: %s\n", wifiSsid.isEmpty() ? "<not configured>" : wifiSsid.c_str());
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Connected: yes, IP=%s, RSSI=%d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  } else {
+    Serial.printf("Connected: no, status=%d\n", WiFi.status());
+  }
+}
+
+void printSerialHelp() {
+  Serial.println("Wi-Fi serial commands:");
+  Serial.println("  wifi config  - enter and save a new SSID/password");
+  Serial.println("  wifi status  - show the current SSID and connection status");
+  Serial.println("  wifi clear   - restore firmware-default credentials");
+  Serial.println("Motor diagnostic commands:");
+  Serial.println("  motor pins             - print the configured motor GPIOs");
+  Serial.println("  motor left|right [pwm] [ms] - run one side (default 100 PWM, 500 ms)");
+  Serial.println("  motor lf|lb|rf|rb [pwm] [ms] - run one H-bridge input (max 10000 ms)");
+  Serial.println("  motor stop             - stop all motor outputs");
+}
+
+void stopSerialMotorTest() {
+  WheelAct(0, 0, 0, 0);
+}
+
+void runSerialMotorTest(const String &arguments) {
+  char target[16] = {0};
+  int pwm = 100;
+  int duration = 500;
+  int parsed = sscanf(arguments.c_str(), "%15s %d %d", target, &pwm, &duration);
+
+  if (parsed < 1 || !strcmp(target, "help")) {
+    Serial.println("Usage: motor pins | motor left|right|lf|lb|rf|rb [pwm 0-255] [ms 1-10000]");
+    return;
+  }
+  if (!strcmp(target, "pins")) {
+    Serial.printf("Motor GPIOs: LF=%d LB=%d RF=%d RB=%d\n", gpLf, gpLb, gpRf, gpRb);
+    return;
+  }
+  if (!strcmp(target, "stop")) {
+    stopSerialMotorTest();
+    Serial.println("Motor outputs stopped");
+    return;
+  }
+  if (strcmp(target, "left") && strcmp(target, "right") &&
+      strcmp(target, "lf") && strcmp(target, "lb") &&
+      strcmp(target, "rf") && strcmp(target, "rb")) {
+    Serial.println("Unknown motor target. Use 'motor help'.");
+    return;
+  }
+
+  pwm = constrain(pwm, 0, 255);
+  duration = constrain(duration, 1, 10000);
+  int lf = 0;
+  int lb = 0;
+  int rf = 0;
+  int rb = 0;
+  if (!strcmp(target, "left") || !strcmp(target, "lf")) lf = pwm;
+  if (!strcmp(target, "lb")) lb = pwm;
+  if (!strcmp(target, "right") || !strcmp(target, "rf")) rf = pwm;
+  if (!strcmp(target, "rb")) rb = pwm;
+
+  Serial.printf("Testing %s: PWM=%d for %d ms\n", target, pwm, duration);
+  WheelAct(lf, lb, rf, rb);
+  delay(duration);
+  stopSerialMotorTest();
+  Serial.println("Motor test complete; outputs stopped");
+}
+
+void restartDevice(const char *message) {
+  Serial.println(message);
+  Serial.flush();
+  delay(200);
+  ESP.restart();
+}
+
+void handleSerialLine(String line) {
+  if (serialConfigState == SERIAL_WIFI_SSID) {
+    line.trim();
+    if (line.isEmpty() || line.length() > 32) {
+      Serial.println("SSID must contain 1-32 characters. Enter SSID:");
+      return;
+    }
+    pendingWifiSsid = line;
+    serialConfigState = SERIAL_WIFI_PASSWORD;
+    Serial.println("Enter password (empty for an open network):");
+    return;
+  }
+
+  if (serialConfigState == SERIAL_WIFI_PASSWORD) {
+    if (line.length() > 63 || (line.length() > 0 && line.length() < 8)) {
+      Serial.println("Password must be empty or contain 8-63 characters. Enter password:");
+      return;
+    }
+    if (!saveWiFiCredentials(pendingWifiSsid, line)) {
+      Serial.println("Failed to save Wi-Fi credentials to NVS");
+      serialConfigState = SERIAL_COMMAND;
+      return;
+    }
+    restartDevice("Wi-Fi credentials saved. Restarting...");
+    return;
+  }
+
+  line.trim();
+  if (line.equalsIgnoreCase("wifi config")) {
+    serialConfigState = SERIAL_WIFI_SSID;
+    Serial.println("Enter SSID:");
+  } else if (line.equalsIgnoreCase("wifi status")) {
+    printWiFiStatus();
+  } else if (line.equalsIgnoreCase("wifi clear")) {
+    Preferences preferences;
+    if (!preferences.begin(preferencesNamespace, false)) {
+      Serial.println("Failed to open Wi-Fi preferences");
+      return;
+    }
+    bool cleared = preferences.clear();
+    preferences.end();
+    if (!cleared) {
+      Serial.println("Failed to clear Wi-Fi credentials");
+      return;
+    }
+    restartDevice("Wi-Fi credentials cleared. Restarting...");
+  } else if (line.equalsIgnoreCase("help") || line.equalsIgnoreCase("wifi help")) {
+    printSerialHelp();
+  } else if (line.startsWith("motor") && (line.length() == 5 || line.charAt(5) == ' ')) {
+    String arguments = line.substring(5);
+    arguments.trim();
+    runSerialMotorTest(arguments);
+  } else if (!line.isEmpty()) {
+    Serial.println("Unknown command. Enter 'wifi help' for available commands.");
+  }
+}
+
+void serviceSerialConfiguration() {
+  while (Serial.available() > 0) {
+    char value = (char)Serial.read();
+    if (value == '\r') {
+      continue;
+    }
+    if (value == '\n') {
+      handleSerialLine(serialLine);
+      serialLine = "";
+    } else if (serialLine.length() < 128) {
+      serialLine += value;
+    }
+  }
+}
+
+void serviceNetworkStatus() {
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (connected && !wifiWasConnected) {
+    WiFiAddr = WiFi.localIP().toString();
+    if (!mdnsStarted) {
+      mdnsStarted = MDNS.begin(hostname);
+      if (mdnsStarted) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.printf("mDNS ready: http://%s.local/\n", hostname);
+      } else {
+        Serial.println("mDNS setup failed");
+      }
+    }
+    Serial.printf("Camera Ready! Open http://%s/\n", WiFiAddr.c_str());
+  }
+  wifiWasConnected = connected;
+}
+
+void handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    Serial.printf("Wi-Fi disconnected, reason=%d\n", info.wifi_sta_disconnected.reason);
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    Serial.printf("Wi-Fi connected, IP=%s\n", WiFi.localIP().toString().c_str());
+  }
+}
 
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
+  Serial.println("Enter 'wifi help' for Wi-Fi configuration commands.");
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -93,30 +313,53 @@ void setup() {
   // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    return;
-  }
-
-  sensor_t *s = esp_camera_sensor_get();
-  // initial sensors are flipped vertically and colors are a bit saturated
-  if (s->id.PID == OV2640_PID) {
-    // s->set_vflip(s, 1);        // flip it back
-    s->set_brightness(s, 1);   // up the brightness just a bit
-    s->set_saturation(s, -2);  // lower the saturation
+    Serial.printf("Camera init failed with error 0x%x; continuing without video\n", err);
+  } else {
+    cameraAvailable = true;
+    sensor_t *s = esp_camera_sensor_get();
+    // initial sensors are flipped vertically and colors are a bit saturated
+    if (s && s->id.PID == OV2640_PID) {
+      // s->set_vflip(s, 1);        // flip it back
+      s->set_brightness(s, 1);   // up the brightness just a bit
+      s->set_saturation(s, -2);  // lower the saturation
+    }
   }
   // drop down frame size for higher initial frame rate
   // if (config.pixel_format == PIXFORMAT_JPEG) {
   //   s->set_framesize(s, FRAMESIZE_QVGA);
   // }
 
-  //----AP模式--------
-  WiFi.softAP(ssid, password);  //设置为软件定义的无线接入点软AP（Access Point）
-  startCameraServer();  //启动一个摄像头服务器
-  Serial.print("Camera Ready!");  //告诉用户摄像头服务器已经准备好，并且提供了访问摄像头的HTTP协议的起始部分。
+  loadWiFiCredentials();
+
+  // Connect to the configured local 2.4 GHz Wi-Fi network.
+  WiFi.setSleep(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname(hostname);
+  WiFi.onEvent(handleWiFiEvent);
+
+  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+  Serial.printf("Connecting to Wi-Fi %s", wifiSsid.c_str());
+  uint32_t connectStartedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - connectStartedAt < wifiConnectTimeoutMs) {
+    serviceSerialConfiguration();
+    delay(100);
+  }
+  Serial.println();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi connection timed out; automatic reconnect remains enabled.");
+    Serial.println("Enter 'wifi config' to set different credentials.");
+  }
+
+  startCameraServer();
+  serviceNetworkStatus();
 }
 
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
-  delay(10000);
+  serviceSerialConfiguration();
+  serviceNetworkStatus();
+  serviceDriveWatchdog();
+  delay(20);
 }
 
