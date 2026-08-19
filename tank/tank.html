@@ -56,6 +56,17 @@
           </dl>
         </section>
         <section class="status-section">
+          <div class="section-title"><strong>引脚配置</strong><span id="pin-state">-</span></div>
+          <div class="wifi-form">
+            <label>左前 (lf)<input id="plf" inputmode="numeric"></label>
+            <label>左后 (lr)<input id="plr" inputmode="numeric"></label>
+            <label>右前 (rf)<input id="prf" inputmode="numeric"></label>
+            <label>右后 (rr)<input id="prr" inputmode="numeric"></label>
+            <button id="psave" type="button">保存并重启</button>
+            <p class="note">修改后坦克会重启并采用新引脚。引脚需为 4 个互不相同的可用 GPIO，且避开串口/启动等敏感脚。</p>
+          </div>
+        </section>
+        <section class="status-section">
           <div class="section-title"><strong>Wi-Fi 设置</strong></div>
           <div class="wifi-form">
             <label>SSID<input id="wssid" spellcheck="false"></label>
@@ -93,11 +104,12 @@
     window.addEventListener("keyup",e=>{if(keyCommands[e.key])release(e.key)});
     window.addEventListener("blur",stopDrive);document.addEventListener("visibilitychange",()=>{if(document.hidden)stopDrive()});
     speed.addEventListener("input",()=>{$("speed-value").textContent=speed.value;$("speed-number").textContent=speed.value;if(held.size)applyDrive()});
-    function renderStatus(d){setConnection(true);$("ssid").textContent=d.ssid||"-";$("ip").textContent=d.ip||"-";$("rssi").textContent=d.rssi!=null?d.rssi+" dBm":"-";$("wifi-mode").textContent=d.wifi_mode==="ap"?"AP 配置模式":"STA 已连接";$("motion").textContent=d.motion||"已停止";$("motion-readout").textContent=d.motion||"已停止";$("speed-readout").textContent=d.speed||"-";if(!$("wssid").value)$("wssid").value=d.ssid||""}
+    function renderStatus(d){setConnection(true);$("ssid").textContent=d.ssid||"-";$("ip").textContent=d.ip||"-";$("rssi").textContent=d.rssi!=null?d.rssi+" dBm":"-";$("wifi-mode").textContent=d.wifi_mode==="ap"?"AP 配置模式":"STA 已连接";$("motion").textContent=d.motion||"已停止";$("motion-readout").textContent=d.motion||"已停止";$("speed-readout").textContent=d.speed||"-";if(!$("wssid").value)$("wssid").value=d.ssid||"";if(d.pins){const p=d.pins;$("plf").value=p.left_forward;$("plr").value=p.left_reverse;$("prf").value=p.right_forward;$("prr").value=p.right_reverse}}
     function refreshStatus(){fetch(api("/api/status"),{cache:"no-store"}).then(r=>{if(!r.ok)throw Error();return r.json()}).then(renderStatus).catch(()=>setConnection(false))}
     function connect(){const next=normalize(hostInput.value.trim());if(!next){setConnection(false);return}baseUrl=next;hostInput.value=next;localStorage.setItem("tank-esp32-host",next);refreshStatus()}
     $("connect").addEventListener("click",connect);hostInput.addEventListener("keydown",e=>{if(e.key==="Enter")connect()});
     $("wsave").addEventListener("click",()=>{const ssid=$("wssid").value.trim(),pw=$("wpass").value.trim();if(!ssid){alert("请输入 SSID");return}if(!confirm("保存后坦克将重启并连接新网络，确定？"))return;fetch(api("/api/wifi?ssid="+encodeURIComponent(ssid)+"&password="+encodeURIComponent(pw)),{cache:"no-store"}).then(r=>r.json()).then(()=>{alert("已保存，坦克正在重启…");setTimeout(()=>refreshStatus(),6000)}).catch(()=>alert("保存失败，请检查连接"))});
+    $("psave").addEventListener("click",()=>{const pinVal=id=>$("p"+id).value.trim(),lf=pinVal("lf"),lr=pinVal("lr"),rf=pinVal("rf"),rr=pinVal("rr");const pins=[lf,lr,rf,rr];if(pins.some(x=>x==="")){alert("请填写全部 4 个引脚");return}if(pins.some(x=>isNaN(x))){alert("引脚需为数字");return}fetch(api("/api/pins?lf="+encodeURIComponent(lf)+"&lr="+encodeURIComponent(lr)+"&rf="+encodeURIComponent(rf)+"&rr="+encodeURIComponent(rr)),{cache:"no-store"}).then(r=>r.json()).then(x=>{if(x.ok){alert("引脚已保存，坦克正在重启…");setTimeout(()=>refreshStatus(),6000)}else{alert("保存失败："+(x.error||"引脚无效，需 4 个互不相同的可用 GPIO"))}}).catch(()=>alert("保存失败，请检查连接"))});
     connect();setInterval(refreshStatus,1500);
   </script>
 </body>

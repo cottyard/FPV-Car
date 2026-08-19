@@ -12,7 +12,7 @@ Independent firmware for the ESP32-D0WD-V3 on `COM4`. The original ESP32-S3 came
 | Right track reverse (B2) | GPIO 14 |
 | GND | GND |
 
-Pins are fixed at compile time in `include/pins.h`. Share GND between ESP32 and driver, and connect the L9110 motor supply to its own power source.
+Pins are the compile-time defaults in `include/pins.h`, but can be changed at runtime (stored in NVS) via the web page or `/api/pins`. Share GND between ESP32 and driver, and connect the L9110 motor supply to its own power source.
 
 GPIO 1/3 are UART0 TX/RX; they were used for motors before and got driven by the ROM bootloader in download mode, spinning the motors despite the firmware not running. Motor pins are now 16/17/15/14 to avoid this.
 
@@ -39,6 +39,10 @@ The firmware serves only a light control API; the UI lives on the PC.
 | `GET /api/control?cmd=stop` | Stop |
 | `GET /api/status` | Speed, motion, wifi_mode, ssid, ip, rssi |
 | `GET /api/wifi?ssid=&password=` | Save Wi-Fi and reboot |
+| `GET /api/pins` | Read current motor GPIO mapping |
+| `GET /api/pins?lf=&lr=&rf=&rr=` | Set motor GPIO mapping (4 distinct usable GPIOs) and reboot |
+
+Motor and Wi-Fi settings are both stored in NVS and changed without reflashing.
 
 ## Build and upload
 

@@ -29,6 +29,16 @@ String wifiSsid = DEFAULT_SSID;
 String wifiPassword = DEFAULT_PASSWORD;
 bool apFallbackActive = false;
 
+// Motor pin configuration, kept in NVS so it can be changed without reflashing.
+constexpr char PIN_NS[] = "tank-pins";
+struct PinConfig {
+  uint8_t leftForward = LEFT_FORWARD_PIN;
+  uint8_t leftReverse = LEFT_REVERSE_PIN;
+  uint8_t rightForward = RIGHT_FORWARD_PIN;
+  uint8_t rightReverse = RIGHT_REVERSE_PIN;
+};
+PinConfig pinCfg;
+
 // Serial configuration state.
 enum SerialConfigState {
   SERIAL_COMMAND,
@@ -93,9 +103,10 @@ const char* motionName() {
   return "履带独立驱动";
 }
 
-// Motor pins are fixed at compile time (see pins.h) and match the physical wiring.
+// Motor pins come from NVS (see loadPinConfig); they can be changed without reflashing.
 void attachMotorPins() {
-  const uint8_t pins[] = {LEFT_FORWARD_PIN, LEFT_REVERSE_PIN, RIGHT_FORWARD_PIN, RIGHT_REVERSE_PIN};
+  const uint8_t pins[] = {pinCfg.leftForward, pinCfg.leftReverse,
+                          pinCfg.rightForward, pinCfg.rightReverse};
   const uint8_t channels[] = {LEFT_FORWARD_CHANNEL, LEFT_REVERSE_CHANNEL, RIGHT_FORWARD_CHANNEL, RIGHT_REVERSE_CHANNEL};
   for (uint8_t index = 0; index < 4; ++index) {
     ledcSetup(channels[index], PWM_FREQUENCY, PWM_RESOLUTION);
@@ -107,6 +118,60 @@ void attachMotorPins() {
 void setupMotors() {
   attachMotorPins();
   stopMotors();
+}
+
+// ---------------------------------------------------------------------------
+// Motor pin configuration (NVS, no reflashing required)
+// ---------------------------------------------------------------------------
+
+// GPIOs safe as outputs on this module (avoids UART0 1/3, strapping 0/2/4/5/12/15
+// on some modules, flash 6-11, and input-only 34-39). Pins must differ from each other.
+bool isValidPin(uint8_t pin) {
+  static const bool usable[40] = {
+    /*0*/false, /*1*/false, /*2*/false, /*3*/false, /*4*/false, /*5*/false,
+    /*6*/false, /*7*/false, /*8*/false, /*9*/false, /*10*/false, /*11*/false,
+    /*12*/false, /*13*/false, /*14*/false, /*15*/false, /*16*/true, /*17*/true,
+    /*18*/true, /*19*/true, /*20*/false, /*21*/false, /*22*/true, /*23*/true,
+    /*24*/false, /*25*/true, /*26*/true, /*27*/true, /*28*/false, /*29*/false,
+    /*30*/false, /*31*/false, /*32*/true, /*33*/true, /*34*/false, /*35*/false,
+    /*36*/false, /*37*/false, /*38*/false, /*39*/false};
+  return pin < 40 && usable[pin];
+}
+
+bool arePinsValid(const PinConfig& config) {
+  const uint8_t pins[4] = {config.leftForward, config.leftReverse,
+                           config.rightForward, config.rightReverse};
+  for (uint8_t index = 0; index < 4; ++index) {
+    if (!isValidPin(pins[index])) return false;
+    for (uint8_t other = index + 1; other < 4; ++other) {
+      if (pins[index] == pins[other]) return false;
+    }
+  }
+  return true;
+}
+
+// Default pins (16/17/15/14) are all usable, so the config is always valid when empty.
+void loadPinConfig() {
+  if (!preferences.begin(PIN_NS, true)) return;
+  pinCfg.leftForward = preferences.getUChar("lf", LEFT_FORWARD_PIN);
+  pinCfg.leftReverse = preferences.getUChar("lr", LEFT_REVERSE_PIN);
+  pinCfg.rightForward = preferences.getUChar("rf", RIGHT_FORWARD_PIN);
+  pinCfg.rightReverse = preferences.getUChar("rr", RIGHT_REVERSE_PIN);
+  preferences.end();
+  if (!arePinsValid(pinCfg)) {
+    pinCfg = PinConfig();  // fall back to defaults if an invalid value was saved
+  }
+}
+
+bool savePinConfig(const PinConfig& config) {
+  if (!arePinsValid(config)) return false;
+  if (!preferences.begin(PIN_NS, false)) return false;
+  preferences.putUChar("lf", config.leftForward);
+  preferences.putUChar("lr", config.leftReverse);
+  preferences.putUChar("rf", config.rightForward);
+  preferences.putUChar("rr", config.rightReverse);
+  preferences.end();
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -235,14 +300,58 @@ void serviceSerialConfiguration() {
 // Web server: light control API only, no embedded web page (page lives on PC)
 // ---------------------------------------------------------------------------
 
+void sendPins() {
+  char body[128];
+  snprintf(body, sizeof(body),
+           "{\"left_forward\":%u,\"left_reverse\":%u,\"right_forward\":%u,\"right_reverse\":%u}",
+           pinCfg.leftForward, pinCfg.leftReverse, pinCfg.rightForward, pinCfg.rightReverse);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", body);
+}
+
+void handlePins() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  const String lfArg = server.arg("lf");
+  const String lrArg = server.arg("lr");
+  const String rfArg = server.arg("rf");
+  const String rrArg = server.arg("rr");
+  if (lfArg.isEmpty() && lrArg.isEmpty() && rfArg.isEmpty() && rrArg.isEmpty()) {
+    sendPins();
+    return;
+  }
+  if (lfArg.isEmpty() || lrArg.isEmpty() || rfArg.isEmpty() || rrArg.isEmpty()) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing pins\"}");
+    return;
+  }
+  PinConfig next;
+  next.leftForward = (uint8_t)lfArg.toInt();
+  next.leftReverse = (uint8_t)lrArg.toInt();
+  next.rightForward = (uint8_t)rfArg.toInt();
+  next.rightReverse = (uint8_t)rrArg.toInt();
+  if (!savePinConfig(next)) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"invalid pins: must be 4 distinct usable GPIOs\"}");
+    return;
+  }
+  server.send(200, "application/json", "{\"ok\":true}");
+  Serial.printf("Motor pins updated via web (lf=%u lr=%u rf=%u rr=%u); restarting\n",
+                next.leftForward, next.leftReverse, next.rightForward, next.rightReverse);
+  delay(300);
+  ESP.restart();
+}
+
 void sendStatus() {
   String ip = apFallbackActive ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   char body[256];
   snprintf(body, sizeof(body),
            "{\"speed\":%u,\"motion\":\"%s\",\"left\":%d,\"right\":%d,"
-           "\"wifi_mode\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d}",
+           "\"wifi_mode\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
+           "\"pins\":{\"left_forward\":%u,\"left_reverse\":%u,"
+           "\"right_forward\":%u,\"right_reverse\":%u}}",
            speedSetting, motionName(), leftDirection, rightDirection,
-           apFallbackActive ? "ap" : "sta", wifiSsid.c_str(), ip.c_str(), WiFi.RSSI());
+           apFallbackActive ? "ap" : "sta", wifiSsid.c_str(), ip.c_str(), WiFi.RSSI(),
+           pinCfg.leftForward, pinCfg.leftReverse, pinCfg.rightForward, pinCfg.rightReverse);
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", body);
@@ -304,6 +413,8 @@ void setup() {
   Serial.println();
   Serial.println("ESP32 Tank - enter 'wifi help' for Wi-Fi configuration commands.");
 
+  loadPinConfig();
+
   setupMotors();
 
   loadWiFiCredentials();
@@ -340,6 +451,7 @@ void setup() {
   server.on("/api/control", HTTP_GET, handleControl);
   server.on("/api/status", HTTP_GET, sendStatus);
   server.on("/api/wifi", HTTP_GET, handleWifi);
+  server.on("/api/pins", HTTP_GET, handlePins);
   server.begin();
 
   Serial.printf("Web API ready at http://%s.local/ (mDNS)\n", HOSTNAME);
