@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b1114">
+<title>ESP32 Tank 控制台</title>
+<style>
+  :root{color-scheme:dark;--bg:#0b1114;--panel:#111b20;--panel2:#17262b;--line:#2a3a40;--text:#edf6f3;--muted:#8ca09f;--teal:#65e6c4;--amber:#f6b73c;--danger:#ff766b}
+  *{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;user-select:none}body{overscroll-behavior:none}button,input{font:inherit}
+  .app{max-width:1000px;margin:auto;padding:18px 22px 30px}.topbar{display:flex;justify-content:space-between;align-items:center;gap:18px;padding:4px 0 17px;border-bottom:1px solid var(--line)}
+  .brand{display:flex;align-items:center;gap:11px;letter-spacing:.08em}.brand-mark{display:grid;place-items:center;width:34px;height:34px;border:1px solid var(--teal);color:var(--teal);font-weight:800}.brand strong{display:block;font-size:15px}.brand small{display:block;margin-top:1px;color:var(--muted);font-size:10px;letter-spacing:.14em}
+  .endpoint{display:flex;align-items:center;gap:7px}.endpoint label{color:var(--muted);font-size:10px;letter-spacing:.12em}.endpoint input{width:200px;padding:8px 9px;border:1px solid var(--line);background:var(--panel);color:var(--text);outline:0}.endpoint input:focus{border-color:var(--teal)}.endpoint button{padding:8px 11px;border:1px solid var(--teal);background:var(--teal);color:#09211c;font-size:11px;font-weight:700;letter-spacing:.08em;cursor:pointer}
+  .connection{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11px;letter-spacing:.06em}.dot{width:8px;height:8px;border-radius:50%;background:var(--danger);box-shadow:0 0 0 3px rgba(255,118,107,.12)}.dot.online{background:var(--teal);box-shadow:0 0 0 3px rgba(101,230,196,.12)}
+  .workspace{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(300px,.8fr);gap:22px;padding-top:22px}
+  .drive-panel{background:var(--panel);border:1px solid var(--line);padding:18px}.section-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:13px;color:var(--muted);font-size:10px;letter-spacing:.16em;text-transform:uppercase}.section-title strong{color:var(--text);font-size:12px;letter-spacing:.08em}
+  .drive-pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:300px;margin:auto}.drive-pad button{aspect-ratio:1.35;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer;touch-action:none;font-size:11px;letter-spacing:.06em;display:grid;place-items:center;transition:background .15s,border-color .15s,transform .08s}.drive-pad button:hover{border-color:#557078}.drive-pad button:active,.drive-pad button.active{transform:translateY(1px);border-color:var(--teal);background:#1c403d;color:var(--teal)}.drive-pad .stop{border-color:#6d413a}.drive-pad .stop:active,.drive-pad .stop.active{border-color:var(--danger);background:#44211d;color:var(--danger)}
+  .speed-row{display:flex;align-items:center;gap:12px;margin-top:6px}.speed-row input{flex:1;accent-color:var(--teal)}.speed-value{min-width:52px;color:var(--teal);text-align:right;font-variant-numeric:tabular-nums}
+  .keys{margin-top:14px;color:var(--muted);font-size:11px;letter-spacing:.05em}.keys kbd{padding:2px 6px;border:1px solid var(--line);border-radius:3px;background:var(--panel2);color:var(--text)}
+  .status-panel{background:var(--panel);border:1px solid var(--line)}.status-section{padding:16px 17px;border-bottom:1px solid var(--line)}.status-section:last-child{border-bottom:0}
+  .readout{display:grid;grid-template-columns:1fr 1fr;gap:11px 16px}.readout div{min-width:0}.readout dt{color:var(--muted);font-size:10px;letter-spacing:.09em;text-transform:uppercase}.readout dd{margin:3px 0 0;color:var(--text);font-size:14px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .wifi-form label{display:block;margin:0 0 10px;color:var(--muted);font-size:11px;letter-spacing:.06em}.wifi-form input{width:100%;margin-top:5px;padding:8px 9px;border:1px solid var(--line);background:var(--panel2);color:var(--text);outline:0}.wifi-form input:focus{border-color:var(--teal)}.wifi-form button{width:100%;padding:10px;border:1px solid var(--amber);background:transparent;color:var(--amber);font-size:11px;font-weight:700;letter-spacing:.1em;cursor:pointer}.wifi-form button:hover{background:rgba(246,183,60,.12)}.wifi-form .note{margin-top:9px;color:var(--muted);font-size:10px;letter-spacing:.05em;line-height:1.6}
+  @media(max-width:760px){.topbar{flex-wrap:wrap}.connection{order:3;width:100%}.workspace{grid-template-columns:1fr;gap:12px;padding-top:15px}}
+  @media(max-width:480px){.app{padding:12px 10px 24px}.endpoint{width:100%}.endpoint input{flex:1;width:auto}}
+</style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">T</span><div><strong>ESP32 TANK</strong><small>LOCAL DRIVE CONTROL</small></div></div>
+      <div class="endpoint"><label for="host">Tank</label><input id="host" value="http://esp32-tank.local" spellcheck="false"><button id="connect" type="button">CONNECT</button></div>
+      <div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-text">DISCONNECTED</span></div>
+    </header>
+    <main class="workspace">
+      <section class="drive-panel">
+        <div class="section-title"><strong>Drive</strong><span id="motion-readout">已停止</span></div>
+        <div class="drive-pad">
+          <span></span><button data-dir="forward"><span>▲</span><span>前进</span></button><span></span>
+          <button data-dir="left"><span>◀</span><span>左转</span></button><button class="stop" data-dir="stop"><span>■</span><span>停止</span></button><button data-dir="right"><span>▶</span><span>右转</span></button>
+          <span></span><button data-dir="back"><span>▼</span><span>后退</span></button><span></span>
+        </div>
+        <div class="section-title" style="margin-top:20px"><strong>Speed</strong><span class="speed-value" id="speed-value">5</span></div>
+        <div class="speed-row"><input id="speed" type="range" min="5" max="255" value="5"><span class="speed-value" id="speed-number">5</span></div>
+        <p class="keys">键盘：<kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> 方向，<kbd>Q</kbd><kbd>A</kbd> 左履带 前进/后退，<kbd>W</kbd><kbd>S</kbd> 右履带 前进/后退，<kbd>空格</kbd> 停止。松开或切窗即停止。</p>
+      </section>
+      <aside class="status-panel">
+        <section class="status-section">
+          <div class="section-title"><strong>Vehicle</strong><span id="vehicle-state">OFFLINE</span></div>
+          <dl class="readout">
+            <div><dt>运动</dt><dd id="motion">已停止</dd></div>
+            <div><dt>速度</dt><dd id="speed-readout">-</dd></div>
+            <div><dt>Wi-Fi</dt><dd id="ssid">-</dd></div>
+            <div><dt>IP</dt><dd id="ip">-</dd></div>
+            <div><dt>信号</dt><dd id="rssi">-</dd></div>
+            <div><dt>模式</dt><dd id="wifi-mode">-</dd></div>
+          </dl>
+        </section>
+        <section class="status-section">
+          <div class="section-title"><strong>Wi-Fi 设置</strong></div>
+          <div class="wifi-form">
+            <label>SSID<input id="wssid" spellcheck="false"></label>
+            <label>密码<input id="wpass" type="password"></label>
+            <button id="wsave" type="button">保存并重启</button>
+            <p class="note">保存后坦克会重启并尝试连接新网络。若连不上，会回到 AP 模式 <b>Tank-Control</b>（密码 tankdrive）。</p>
+          </div>
+        </section>
+      </aside>
+    </main>
+  </div>
+  <script>
+    const $=id=>document.getElementById(id),hostInput=$("host"),speed=$("speed");
+    const savedHost=localStorage.getItem("tank-esp32-host");let baseUrl=savedHost||hostInput.value;
+    hostInput.value=baseUrl;
+    // 轨道命令：l/r 分别为左/右履带，f 前进、r 后退、0 停止
+    const dirToTracks={forward:{l:"f",r:"f"},back:{l:"r",r:"r"},left:{l:"r",r:"f"},right:{l:"f",r:"r"}};
+    // 键盘：方向键整体控制，Q/A 左履带 前进/后退，W/S 右履带 前进/后退
+    const keyCommands={ArrowUp:dirToTracks.forward,ArrowDown:dirToTracks.back,ArrowLeft:dirToTracks.left,ArrowRight:dirToTracks.right,q:{l:"f",r:"0"},a:{l:"r",r:"0"},w:{l:"0",r:"f"},s:{l:"0",r:"r"}};
+    const held=new Map(); // 当前按住的来源(键名/按钮) -> 轨道命令，支持多条履带同时操作
+    let heartbeat=null;
+    function normalize(value){try{const u=new URL(value.indexOf("://")<0?"http://"+value:value);u.pathname="";u.search="";u.hash="";return u.toString().replace(/\/$/,"")}catch{return null}}
+    function api(path){return baseUrl+path}
+    function setConnection(online){$("connection-dot").classList.toggle("online",online);$("connection-text").textContent=online?"CONNECTED":"DISCONNECTED";$("vehicle-state").textContent=online?"ONLINE":"OFFLINE"}
+    function motionLabel(l,r){if(l==="0"&&r==="0")return "已停止";if(l==="f"&&r==="f")return "前进";if(l==="r"&&r==="r")return "后退";return "履带独立驱动"}
+    function currentTracks(){let l="0",r="0";for(const cmd of held.values()){if(!cmd)continue;if(cmd.l!=="0")l=cmd.l;if(cmd.r!=="0")r=cmd.r}return{l,r}}
+    function updateButtons(l,r){document.querySelectorAll("[data-dir]").forEach(b=>{const t=dirToTracks[b.dataset.dir];b.classList.toggle("active",b.dataset.dir==="stop"?(l==="0"&&r==="0"):!!t&&t.l===l&&t.r===r)})}
+    function markMotion(l,r){const name=motionLabel(l,r);$("motion-readout").textContent=name;$("motion").textContent=name;updateButtons(l,r)}
+    function applyDrive(){const {l,r}=currentTracks();if(l==="0"&&r==="0"){stopDrive();return}markMotion(l,r);fetch(api("/api/control?cmd=drive&left="+l+"&right="+r+"&speed="+speed.value),{cache:"no-store"}).then(res=>res.json()).then(x=>{setConnection(true);$("speed-readout").textContent=x.speed}).catch(()=>setConnection(false))}
+    function stopDrive(){held.clear();if(heartbeat){clearInterval(heartbeat);heartbeat=null}markMotion("0","0");fetch(api("/api/control?cmd=stop"),{cache:"no-store"}).then(()=>setConnection(true)).catch(()=>setConnection(false))}
+    function press(key,cmd,e){if(e)e.preventDefault();held.set(key,cmd);applyDrive();if(!heartbeat)heartbeat=setInterval(()=>{if(held.size)applyDrive()},250)}
+    function release(key,e){if(e)e.preventDefault();held.delete(key);if(!held.size)stopDrive();else applyDrive()}
+    document.querySelectorAll("[data-dir]").forEach(button=>{const dir=button.dataset.dir;if(dir==="stop"){button.addEventListener("pointerdown",e=>{e.preventDefault();stopDrive()});return}button.addEventListener("pointerdown",e=>{button.setPointerCapture(e.pointerId);press(dir,dirToTracks[dir],e)});["pointerup","pointercancel"].forEach(n=>button.addEventListener(n,e=>release(dir,e)))});
+    window.addEventListener("keydown",e=>{if(e.repeat)return;if(e.key===" "){e.preventDefault();stopDrive();return}const cmd=keyCommands[e.key];if(!cmd)return;e.preventDefault();press(e.key,cmd,e)});
+    window.addEventListener("keyup",e=>{if(keyCommands[e.key])release(e.key)});
+    window.addEventListener("blur",stopDrive);document.addEventListener("visibilitychange",()=>{if(document.hidden)stopDrive()});
+    speed.addEventListener("input",()=>{$("speed-value").textContent=speed.value;$("speed-number").textContent=speed.value;if(held.size)applyDrive()});
+    function renderStatus(d){setConnection(true);$("ssid").textContent=d.ssid||"-";$("ip").textContent=d.ip||"-";$("rssi").textContent=d.rssi!=null?d.rssi+" dBm":"-";$("wifi-mode").textContent=d.wifi_mode==="ap"?"AP 配置模式":"STA 已连接";$("motion").textContent=d.motion||"已停止";$("motion-readout").textContent=d.motion||"已停止";$("speed-readout").textContent=d.speed||"-";if(!$("wssid").value)$("wssid").value=d.ssid||""}
+    function refreshStatus(){fetch(api("/api/status"),{cache:"no-store"}).then(r=>{if(!r.ok)throw Error();return r.json()}).then(renderStatus).catch(()=>setConnection(false))}
+    function connect(){const next=normalize(hostInput.value.trim());if(!next){setConnection(false);return}baseUrl=next;hostInput.value=next;localStorage.setItem("tank-esp32-host",next);refreshStatus()}
+    $("connect").addEventListener("click",connect);hostInput.addEventListener("keydown",e=>{if(e.key==="Enter")connect()});
+    $("wsave").addEventListener("click",()=>{const ssid=$("wssid").value.trim(),pw=$("wpass").value.trim();if(!ssid){alert("请输入 SSID");return}if(!confirm("保存后坦克将重启并连接新网络，确定？"))return;fetch(api("/api/wifi?ssid="+encodeURIComponent(ssid)+"&password="+encodeURIComponent(pw)),{cache:"no-store"}).then(r=>r.json()).then(()=>{alert("已保存，坦克正在重启…");setTimeout(()=>refreshStatus(),6000)}).catch(()=>alert("保存失败，请检查连接"))});
+    connect();setInterval(refreshStatus,1500);
+  </script>
+</body>
+</html>
