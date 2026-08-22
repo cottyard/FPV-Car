@@ -293,7 +293,7 @@ void setup() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_QVGA;//FRAMESIZE_CIF;//FRAMESIZE_QQVGA;
+  config.frame_size = FRAMESIZE_QQVGA;//FRAMESIZE_QVGA;//FRAMESIZE_CIF;
   config.pixel_format = PIXFORMAT_JPEG;  // for streaming
   // config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;//CAMERA_GRAB_WHEN_EMPTY;
@@ -305,7 +305,11 @@ void setup() {
   //                      for larger pre-allocated frame buffer.
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (psramFound()) {
-      config.jpeg_quality = 3;
+      // 本模块 OV3660 在低 quality 值(高画质/大帧)下 JPEG 编码负载过大会永久卡死：
+      // QVGA(320x240) quality<=3 卡死、QQVGA(160x120) quality<=5 开机即卡死(esp_camera_fb_get 阻塞，
+      // esp_camera_return_all 无法恢复，需抬 quality 或重启)。稳定值取 10 作为默认。
+      // 用户经网页下调到更低值时，推流 handler 会自动恢复(抬到安全档位)，见 app_httpd.cpp。
+      config.jpeg_quality = 10;
       config.fb_count = 2;
       config.grab_mode = CAMERA_GRAB_LATEST;
       Serial.printf("Found\n");

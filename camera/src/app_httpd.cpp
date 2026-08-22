@@ -104,6 +104,11 @@ static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 // 运行时可通过 /api/camera?var=fps&val=N 调整（1-30）。
 uint32_t gStreamFps = 10;
 
+// 自动恢复状态：本模块 OV3660 在低 quality 值(高画质/大帧)下编码负载过大可能永久卡死
+// (esp_camera_fb_get 阻塞，仅靠 esp_camera_return_all 无法恢复)。实测 quality>=10 稳定；
+// 因此推流长时间无帧时自动把 quality 抬到安全档位解除卡死，触发后不再自动降回，避免反复卡死。
+static int gRecoveryQuality = 0; // 0=未触发自动恢复；>0=当前恢复档位
+
 static ra_filter_t ra_filter;
 static httpd_handle_t stream_httpd = NULL;
 static httpd_handle_t api_httpd = NULL;
@@ -191,13 +196,8 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     if (!cameraAvailable) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera unavailable");
     }
-    // 单客户端锁：已有推流客户端时拒绝新连接，避免并发抓帧搞乱摄像头驱动。
-    if (streamLock == NULL || xSemaphoreTake(streamLock, 0) != pdTRUE) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "stream busy");
-    }
     esp_err_t result = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (result != ESP_OK) {
-        xSemaphoreGive(streamLock);
         return result;
     }
     set_cors(req);
@@ -207,6 +207,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     int consecutive_failures = 0;
     const int FAIL_RESET_THRESHOLD = 5;   // 连续失败达到该次数时重置驱动
     const int64_t STALL_RESET_US = 3000000; // 距上次成功帧超过 3s 仍未取到帧时重置驱动
+    const int64_t RECOVERY_STALL_US = 20000000; // 距上次成功帧超过 20s 仍取不到帧 → 自动恢复(抬 quality)
 
     while (true) {
         // 按目标帧率控制发送节奏，未到间隔则等待。
@@ -214,6 +215,24 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         int64_t elapsed_ms = (esp_timer_get_time() - last_frame) / 1000;
         if (elapsed_ms < frameIntervalMs) {
             delay(frameIntervalMs - (uint32_t)elapsed_ms);
+        }
+
+        // 自动恢复：长时间无帧说明编码器已永久卡死，仅重置驱动无法恢复。
+        // 实测将 JPEG quality 抬到安全档位(减轻编码负载)可解除卡死；档位 10 -> 15 -> 20。
+        if ((esp_timer_get_time() - last_frame) > RECOVERY_STALL_US) {
+            int target = gRecoveryQuality == 0 ? 10 : min(gRecoveryQuality + 5, 20);
+            sensor_t *s = esp_camera_sensor_get();
+            if (s != NULL) {
+                logLine("Auto-recovery: stalled %ums, raising quality -> %d\n",
+                        (unsigned int)((esp_timer_get_time() - last_frame) / 1000), target);
+                if (s->set_quality(s, target) == 0) {
+                    gRecoveryQuality = target;
+                }
+            }
+            consecutive_failures = 0;
+            last_frame = esp_timer_get_time();
+            delay(50);
+            continue;
         }
 
         // 超时保护：长时间取不到帧说明驱动卡住，重置摄像头驱动恢复数据链路。
@@ -224,12 +243,21 @@ static esp_err_t stream_handler(httpd_req_t *req) {
             consecutive_failures = 0;
         }
 
+        // 每帧抓取+发送期间持锁：串行化 esp_camera_fb_get/return（驱动不支持并发抓帧），
+        // 同时避免“整连接持锁”——若摄像头卡住，整连接持锁会让该连接永远占用 socket，
+        // 后续新连接(含浏览器重连)永久得不到响应。
+        if (streamLock == NULL || xSemaphoreTake(streamLock, pdMS_TO_TICKS(200)) != pdTRUE) {
+            delay(20); // 另一客户端正在抓帧/发送，稍后重试
+            continue;
+        }
+
         camera_fb_t *fb = esp_camera_fb_get();
         uint8_t *jpg_buf = NULL;
         size_t jpg_len = 0;
         bool converted = false;
 
         if (!fb) {
+            xSemaphoreGive(streamLock);
             // 抓帧偶发失败/超时：跳过本帧继续推流，不中断连接。
             consecutive_failures++;
             logLine("Camera capture failed (skipped, %d consecutive)\n", consecutive_failures);
@@ -250,6 +278,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
             if (!converted) {
                 logLine("JPEG conversion failed (skipped)\n");
                 esp_camera_fb_return(fb);
+                xSemaphoreGive(streamLock);
                 consecutive_failures++;
                 delay(20);
                 continue;
@@ -274,6 +303,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         if (converted && jpg_buf) {
             free(jpg_buf);
         }
+        xSemaphoreGive(streamLock);
         if (result != ESP_OK) {
             break;
         }
@@ -284,7 +314,6 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         uint32_t average_ms = ra_filter_run(&ra_filter, frame_ms);
         logLine("MJPG: %uB %ums, avg %ums\n", (unsigned int)jpg_len, frame_ms, average_ms);
     }
-    xSemaphoreGive(streamLock);
     return result;
 }
 
@@ -465,6 +494,10 @@ void startCameraServer() {
     httpd_config_t api_config = HTTPD_DEFAULT_CONFIG();
     api_config.max_uri_handlers = 10;
     api_config.stack_size = 16384; // 默认 4096 太小，推流/日志等调用链会栈溢出(Stack canary watchpoint)
+    // 网页轮询(status 1s + wifi 3s)会占满默认的 7 个 socket；增大池并启用 LRU 淘汰，
+    // 避免连接堆积后新连接(含推流)完全得不到响应(code=000 / CONNECTING 卡死)。
+    api_config.max_open_sockets = 10;
+    api_config.lru_purge_enable = true;
 
     httpd_uri_t index_uri = {.uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL};
     httpd_uri_t status_uri = {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL};
@@ -496,6 +529,10 @@ void startCameraServer() {
         stream_config.server_port = 81;
         stream_config.ctrl_port = api_config.ctrl_port + 1;
         stream_config.stack_size = 16384; // 推流 handler 调用链深，默认栈会溢出
+        // 与 API 服务器同样的连接池调整：默认 7 socket + 不淘汰，浏览器长连接推流会占满，
+        // 导致新连接(含重连)完全得不到响应而卡在 CONNECTING。
+        stream_config.max_open_sockets = 10;
+        stream_config.lru_purge_enable = true;
         httpd_uri_t stream_uri = {.uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL};
 
         Serial.printf("Starting stream server on port %d\n", stream_config.server_port);
