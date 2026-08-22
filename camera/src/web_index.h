@@ -1,4 +1,6 @@
-<!doctype html>
+#pragma once
+// Built-in web UI served at "/". Kept in sync with web/index.html.
+const char index_htm[] PROGMEM = R"rawliteral(<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -94,3 +96,5 @@
   </script>
 </body>
 </html>
+
+)rawliteral";

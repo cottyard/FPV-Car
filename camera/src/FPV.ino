@@ -269,7 +269,7 @@ void setupOTA() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.setDebugOutput(true);
+  // Serial.setDebugOutput(true); // 关闭：esp32-camera 驱动日志高频走 USB CDC，电池供电(无USB主机)时会触发 int_wdt 重启
   Serial.println();
   Serial.println("Enter 'wifi help' for Wi-Fi configuration commands.");
 
@@ -293,7 +293,7 @@ void setup() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_CIF;//FRAMESIZE_QVGA;//FRAMESIZE_QQVGA;
+  config.frame_size = FRAMESIZE_QVGA;//FRAMESIZE_CIF;//FRAMESIZE_QQVGA;
   config.pixel_format = PIXFORMAT_JPEG;  // for streaming
   // config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;//CAMERA_GRAB_WHEN_EMPTY;
@@ -305,7 +305,7 @@ void setup() {
   //                      for larger pre-allocated frame buffer.
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (psramFound()) {
-      config.jpeg_quality = 10;
+      config.jpeg_quality = 3;
       config.fb_count = 2;
       config.grab_mode = CAMERA_GRAB_LATEST;
       Serial.printf("Found\n");

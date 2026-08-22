@@ -2,8 +2,53 @@
 #include "esp_timer.h"
 #include "esp_camera.h"
 #include "img_converters.h"
+#include "esp_system.h"
 #include "Arduino.h"
 #include <WiFi.h>
+#include <stdarg.h>
+#include "web_index.h"
+#include "driver/temp_sensor.h"
+
+// 内存日志环形缓冲：记录推流相关日志，可通过 /api/log 经 WiFi 读取。
+#define LOG_RING_SIZE 200
+#define LOG_LINE_MAX 96
+static char logRing[LOG_RING_SIZE][LOG_LINE_MAX];
+static int logWriteIdx = 0;
+static int logCount = 0;
+
+// 写入一行日志：同时输出到串口和内存缓冲。
+static void logLine(const char *fmt, ...) {
+    char line[LOG_LINE_MAX];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+    // 仅写入内存缓冲，经 /api/log 读取。
+    // 不向 Serial 打印：电池供电时 USB CDC 无主机，高频串口输出会触发 int_wdt 重启。
+    strncpy(logRing[logWriteIdx], line, LOG_LINE_MAX - 1);
+    logRing[logWriteIdx][LOG_LINE_MAX - 1] = '\0';
+    logWriteIdx = (logWriteIdx + 1) % LOG_RING_SIZE;
+    if (logCount < LOG_RING_SIZE) {
+        logCount++;
+    }
+}
+
+// 将上次复位原因转为可读字符串，用于区分供电(brownout)/固件(panic/wdt)问题。
+static const char *resetReasonStr(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:    return "power_on";
+        case ESP_RST_EXT:        return "external_pin";
+        case ESP_RST_SW:         return "software";
+        case ESP_RST_PANIC:      return "panic";
+        case ESP_RST_INT_WDT:    return "int_wdt";
+        case ESP_RST_TASK_WDT:   return "task_wdt";
+        case ESP_RST_WDT:        return "other_wdt";
+        case ESP_RST_DEEPSLEEP:  return "deep_sleep";
+        case ESP_RST_BROWNOUT:   return "brownout";
+        case ESP_RST_SDIO:       return "sdio";
+        default:                 return "unknown";
+    }
+}
 
 extern bool cameraAvailable;
 
@@ -18,6 +63,24 @@ extern int wifiNetworkCount;
 extern bool addWifiNetwork(const String &ssid, const String &password);
 extern bool removeWifiNetwork(int index);
 extern const char *hostname;
+
+// ESP32-S3 内置温度传感器：懒初始化，失败时返回 NAN。
+static float readChipTemp() {
+    static bool tsensInit = false;
+    if (!tsensInit) {
+        temp_sensor_config_t cfg = TSENS_CONFIG_DEFAULT();
+        if (temp_sensor_set_config(cfg) == ESP_OK && temp_sensor_start() == ESP_OK) {
+            tsensInit = true;
+        } else {
+            return NAN;
+        }
+    }
+    float celsius = NAN;
+    if (temp_sensor_read_celsius(&celsius) != ESP_OK) {
+        return NAN;
+    }
+    return celsius;
+}
 
 typedef struct {
     size_t size;
@@ -37,9 +100,24 @@ static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" 
 static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
+// 推流帧率上限：只限制发送节奏，采集仍按相机原始帧率进行。
+// 运行时可通过 /api/camera?var=fps&val=N 调整（1-30）。
+uint32_t gStreamFps = 10;
+
 static ra_filter_t ra_filter;
 static httpd_handle_t stream_httpd = NULL;
 static httpd_handle_t api_httpd = NULL;
+// 单客户端锁：esp32-camera 驱动不支持并发抓帧，多个 stream 连接会互相干扰导致驱动卡死。
+static SemaphoreHandle_t streamLock = NULL;
+
+static esp_err_t index_handler(httpd_req_t *req);
+static void set_cors(httpd_req_t *req);
+
+static esp_err_t index_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    set_cors(req);
+    return httpd_resp_send(req, (const char *)index_htm, strlen(index_htm));
+}
 
 static void set_cors(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -89,7 +167,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     }
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-        Serial.println("Camera capture failed");
+        logLine("Camera capture failed\n");
         return httpd_resp_send_500(req);
     }
 
@@ -113,38 +191,76 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     if (!cameraAvailable) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera unavailable");
     }
+    // 单客户端锁：已有推流客户端时拒绝新连接，避免并发抓帧搞乱摄像头驱动。
+    if (streamLock == NULL || xSemaphoreTake(streamLock, 0) != pdTRUE) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "stream busy");
+    }
     esp_err_t result = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (result != ESP_OK) {
+        xSemaphoreGive(streamLock);
         return result;
     }
     set_cors(req);
 
     int64_t last_frame = esp_timer_get_time();
+    // 连续抓帧失败计数：用于跳过单帧 + 重置驱动，避免偶发变慢导致推流中断卡死。
+    int consecutive_failures = 0;
+    const int FAIL_RESET_THRESHOLD = 5;   // 连续失败达到该次数时重置驱动
+    const int64_t STALL_RESET_US = 3000000; // 距上次成功帧超过 3s 仍未取到帧时重置驱动
+
     while (true) {
+        // 按目标帧率控制发送节奏，未到间隔则等待。
+        uint32_t frameIntervalMs = 1000 / gStreamFps;
+        int64_t elapsed_ms = (esp_timer_get_time() - last_frame) / 1000;
+        if (elapsed_ms < frameIntervalMs) {
+            delay(frameIntervalMs - (uint32_t)elapsed_ms);
+        }
+
+        // 超时保护：长时间取不到帧说明驱动卡住，重置摄像头驱动恢复数据链路。
+        if (consecutive_failures > 0 && (esp_timer_get_time() - last_frame) > STALL_RESET_US) {
+            logLine("Stream stalled %ums, resetting camera driver\n",
+                    (unsigned int)((esp_timer_get_time() - last_frame) / 1000));
+            esp_camera_return_all();
+            consecutive_failures = 0;
+        }
+
         camera_fb_t *fb = esp_camera_fb_get();
         uint8_t *jpg_buf = NULL;
         size_t jpg_len = 0;
         bool converted = false;
 
         if (!fb) {
-            Serial.println("Camera capture failed");
-            result = ESP_FAIL;
-        } else if (fb->format == PIXFORMAT_JPEG) {
+            // 抓帧偶发失败/超时：跳过本帧继续推流，不中断连接。
+            consecutive_failures++;
+            logLine("Camera capture failed (skipped, %d consecutive)\n", consecutive_failures);
+            if (consecutive_failures >= FAIL_RESET_THRESHOLD) {
+                logLine("Repeated capture failures, resetting camera driver\n");
+                esp_camera_return_all();
+                consecutive_failures = 0;
+            }
+            delay(20);
+            continue;
+        }
+
+        if (fb->format == PIXFORMAT_JPEG) {
             jpg_buf = fb->buf;
             jpg_len = fb->len;
         } else {
             converted = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
             if (!converted) {
-                Serial.println("JPEG conversion failed");
-                result = ESP_FAIL;
+                logLine("JPEG conversion failed (skipped)\n");
+                esp_camera_fb_return(fb);
+                consecutive_failures++;
+                delay(20);
+                continue;
             }
         }
 
-        if (result == ESP_OK) {
-            char part_buf[64];
-            size_t header_len = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, jpg_len);
-            result = httpd_resp_send_chunk(req, part_buf, header_len);
-        }
+        consecutive_failures = 0;
+
+        char part_buf[64];
+        size_t header_len = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, jpg_len);
+        result = httpd_resp_send_chunk(req, part_buf, header_len);
         if (result == ESP_OK) {
             result = httpd_resp_send_chunk(req, (const char *)jpg_buf, jpg_len);
         }
@@ -166,8 +282,9 @@ static esp_err_t stream_handler(httpd_req_t *req) {
         uint32_t frame_ms = (uint32_t)((now - last_frame) / 1000);
         last_frame = now;
         uint32_t average_ms = ra_filter_run(&ra_filter, frame_ms);
-        Serial.printf("MJPG: %uB %ums, avg %ums\n", (unsigned int)jpg_len, frame_ms, average_ms);
+        logLine("MJPG: %uB %ums, avg %ums\n", (unsigned int)jpg_len, frame_ms, average_ms);
     }
+    xSemaphoreGive(streamLock);
     return result;
 }
 
@@ -183,11 +300,18 @@ static esp_err_t camera_control_handler(httpd_req_t *req) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected var and val");
     }
 
+    int val = atoi(value);
+    if (!strcmp(variable, "fps")) {
+        gStreamFps = constrain(val, 1, 30);
+        Serial.printf("Stream fps set to %u\n", gStreamFps);
+        set_cors(req);
+        return httpd_resp_send(req, NULL, 0);
+    }
+
     if (!cameraAvailable) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "camera unavailable");
     }
     sensor_t *sensor = esp_camera_sensor_get();
-    int val = atoi(value);
     int result = -1;
     if (!strcmp(variable, "framesize") && sensor->pixformat == PIXFORMAT_JPEG) result = sensor->set_framesize(sensor, (framesize_t)val);
     else if (!strcmp(variable, "quality")) result = sensor->set_quality(sensor, val);
@@ -214,20 +338,43 @@ static esp_err_t status_handler(httpd_req_t *req) {
 
     char response[640];
     String ip = WiFi.localIP().toString();
+    char tempStr[16];
+    {
+        float t = readChipTemp();
+        if (isnan(t)) {
+            strcpy(tempStr, "null");
+        } else {
+            snprintf(tempStr, sizeof(tempStr), "%.1f", t);
+        }
+    }
     snprintf(response, sizeof(response),
              "{\"ip\":\"%s\",\"hostname\":\"%s.local\",\"uptime_ms\":%lu,"
              "\"free_heap\":%lu,\"psram_size\":%lu,\"free_psram\":%lu,\"wifi_rssi\":%d,"
-             "\"cpu_mhz\":%u,"
+             "\"cpu_mhz\":%u,\"temp_c\":%s,\"reset_reason\":\"%s\","
              "\"camera_available\":%s,\"framesize\":%d,\"quality\":%d,"
-             "\"brightness\":%d,\"contrast\":%d,\"saturation\":%d}",
+             "\"brightness\":%d,\"contrast\":%d,\"saturation\":%d,\"fps\":%u}",
              ip.c_str(), hostname, (unsigned long)millis(), (unsigned long)ESP.getFreeHeap(),
              (unsigned long)ESP.getPsramSize(), (unsigned long)ESP.getFreePsram(), WiFi.RSSI(),
-             (unsigned int)ESP.getCpuFreqMHz(), sensor ? "true" : "false", framesize, quality,
-             brightness, contrast, saturation);
+             (unsigned int)ESP.getCpuFreqMHz(), tempStr, resetReasonStr(esp_reset_reason()),
+             sensor ? "true" : "false", framesize, quality,
+             brightness, contrast, saturation, gStreamFps);
 
     httpd_resp_set_type(req, "application/json");
     set_cors(req);
     return httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t log_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/plain");
+    set_cors(req);
+    String body;
+    body.reserve((size_t)logCount * LOG_LINE_MAX);
+    int start = (logWriteIdx - logCount + LOG_RING_SIZE) % LOG_RING_SIZE;
+    for (int i = 0; i < logCount; i++) {
+        int idx = (start + i) % LOG_RING_SIZE;
+        body += logRing[idx];
+    }
+    return httpd_resp_send(req, body.c_str(), body.length());
 }
 
 static esp_err_t wifi_list_handler(httpd_req_t *req) {
@@ -313,11 +460,15 @@ static void register_uri(httpd_handle_t server, httpd_uri_t *uri) {
 
 void startCameraServer() {
     ra_filter_init(&ra_filter, 20);
+    streamLock = xSemaphoreCreateMutex();
 
     httpd_config_t api_config = HTTPD_DEFAULT_CONFIG();
-    api_config.max_uri_handlers = 8;
+    api_config.max_uri_handlers = 10;
+    api_config.stack_size = 16384; // 默认 4096 太小，推流/日志等调用链会栈溢出(Stack canary watchpoint)
 
+    httpd_uri_t index_uri = {.uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL};
     httpd_uri_t status_uri = {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL};
+    httpd_uri_t log_uri = {.uri = "/api/log", .method = HTTP_GET, .handler = log_handler, .user_ctx = NULL};
     httpd_uri_t camera_uri = {.uri = "/api/camera", .method = HTTP_GET, .handler = camera_control_handler, .user_ctx = NULL};
     httpd_uri_t capture_uri = {.uri = "/api/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL};
     httpd_uri_t wifi_list_uri = {.uri = "/api/wifi", .method = HTTP_GET, .handler = wifi_list_handler, .user_ctx = NULL};
@@ -327,7 +478,9 @@ void startCameraServer() {
 
     Serial.printf("Starting API server on port %d\n", api_config.server_port);
     if (httpd_start(&api_httpd, &api_config) == ESP_OK) {
+        register_uri(api_httpd, &index_uri);
         register_uri(api_httpd, &status_uri);
+        register_uri(api_httpd, &log_uri);
         register_uri(api_httpd, &wifi_list_uri);
         register_uri(api_httpd, &wifi_add_uri);
         register_uri(api_httpd, &wifi_remove_uri);
@@ -342,6 +495,7 @@ void startCameraServer() {
         httpd_config_t stream_config = HTTPD_DEFAULT_CONFIG();
         stream_config.server_port = 81;
         stream_config.ctrl_port = api_config.ctrl_port + 1;
+        stream_config.stack_size = 16384; // 推流 handler 调用链深，默认栈会溢出
         httpd_uri_t stream_uri = {.uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL};
 
         Serial.printf("Starting stream server on port %d\n", stream_config.server_port);
