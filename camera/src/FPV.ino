@@ -6,16 +6,23 @@
 #include "camera_pins.h"
 
 // Firmware defaults are only a fallback; the working credentials are read from
-// NVS (see loadWiFiCredentials). Configure them with the 'wifi config' command.
+// NVS (see loadWifiNetworks). Configure networks with the 'wifi add' command.
+#define MAX_WIFI_NETWORKS 8
 const char *defaultSsid = "fhjqr";
 const char *defaultPassword = "12345678";
-const char *hostname = "fpv-car";
+const char *hostname = "cam";
 const char *preferencesNamespace = "fpv-wifi";
-const uint32_t wifiConnectTimeoutMs = 20000;
+const uint32_t wifiConnectTimeoutMs = 10000;
 
 String WiFiAddr;
-String wifiSsid;
-String wifiPassword;
+
+typedef struct {
+  String ssid;
+  String password;
+} WifiNetwork;
+
+WifiNetwork wifiNetworks[MAX_WIFI_NETWORKS];
+int wifiNetworkCount = 0;
 
 enum SerialConfigState {
   SERIAL_COMMAND,
@@ -33,32 +40,90 @@ bool cameraAvailable = false;
 void startCameraServer();
 void serviceSerialConfiguration();
 
-void loadWiFiCredentials() {
+void loadWifiNetworks() {
   Preferences preferences;
   if (!preferences.begin(preferencesNamespace, true)) {
-    wifiSsid = defaultSsid;
-    wifiPassword = defaultPassword;
-    return;
+    wifiNetworkCount = 0;
+  } else {
+    int count = preferences.getInt("count", 0);
+    wifiNetworkCount = 0;
+    for (int i = 0; i < count && i < MAX_WIFI_NETWORKS; i++) {
+      String ssid = preferences.getString(("s" + String(i)).c_str(), "");
+      if (!ssid.isEmpty()) {
+        wifiNetworks[wifiNetworkCount].ssid = ssid;
+        wifiNetworks[wifiNetworkCount].password = preferences.getString(("p" + String(i)).c_str(), "");
+        wifiNetworkCount++;
+      }
+    }
+    preferences.end();
   }
-
-  wifiSsid = preferences.getString("ssid", defaultSsid);
-  wifiPassword = preferences.getString("password", defaultPassword);
-  preferences.end();
+  // No saved networks: fall back to the firmware defaults.
+  if (wifiNetworkCount == 0) {
+    wifiNetworks[0].ssid = defaultSsid;
+    wifiNetworks[0].password = defaultPassword;
+    wifiNetworkCount = 1;
+  }
 }
 
-bool saveWiFiCredentials(const String &ssid, const String &password) {
+bool addWifiNetwork(const String &ssid, const String &password) {
   Preferences preferences;
   if (!preferences.begin(preferencesNamespace, false)) {
     return false;
   }
-  bool saved = preferences.putString("ssid", ssid) == ssid.length();
-  saved = preferences.putString("password", password) == password.length() && saved;
+  int count = preferences.getInt("count", 0);
+  // Update the password if the SSID is already saved.
+  for (int i = 0; i < count; i++) {
+    if (preferences.getString(("s" + String(i)).c_str(), "") == ssid) {
+      preferences.putString(("p" + String(i)).c_str(), password);
+      preferences.end();
+      return true;
+    }
+  }
+  if (count >= MAX_WIFI_NETWORKS) {
+    preferences.end();
+    return false;
+  }
+  bool ok = preferences.putString(("s" + String(count)).c_str(), ssid) == ssid.length();
+  ok = preferences.putString(("p" + String(count)).c_str(), password) == password.length() && ok;
+  ok = preferences.putInt("count", count + 1) != 0 && ok;
   preferences.end();
-  return saved;
+  return ok;
+}
+
+bool removeWifiNetwork(int index) {
+  Preferences preferences;
+  if (!preferences.begin(preferencesNamespace, false)) {
+    return false;
+  }
+  int count = preferences.getInt("count", 0);
+  if (index < 0 || index >= count) {
+    preferences.end();
+    return false;
+  }
+  for (int i = index; i < count - 1; i++) {
+    preferences.putString(("s" + String(i)).c_str(), preferences.getString(("s" + String(i + 1)).c_str(), ""));
+    preferences.putString(("p" + String(i)).c_str(), preferences.getString(("p" + String(i + 1)).c_str(), ""));
+  }
+  preferences.remove(("s" + String(count - 1)).c_str());
+  preferences.remove(("p" + String(count - 1)).c_str());
+  preferences.putInt("count", count - 1);
+  preferences.end();
+  return true;
+}
+
+void printWifiNetworks() {
+  if (wifiNetworkCount == 0) {
+    Serial.println("  <none>");
+    return;
+  }
+  for (int i = 0; i < wifiNetworkCount; i++) {
+    Serial.printf("  [%d] %s\n", i, wifiNetworks[i].ssid.c_str());
+  }
 }
 
 void printWiFiStatus() {
-  Serial.printf("Configured SSID: %s\n", wifiSsid.isEmpty() ? "<not configured>" : wifiSsid.c_str());
+  Serial.println("Saved networks:");
+  printWifiNetworks();
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("Connected: yes, IP=%s, RSSI=%d dBm\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
@@ -69,9 +134,11 @@ void printWiFiStatus() {
 
 void printSerialHelp() {
   Serial.println("Wi-Fi serial commands:");
-  Serial.println("  wifi config  - enter and save a new SSID/password");
-  Serial.println("  wifi status  - show the current SSID and connection status");
-  Serial.println("  wifi clear   - restore firmware-default credentials");
+  Serial.println("  wifi list       - show saved networks and connection status");
+  Serial.println("  wifi add        - add/save a new SSID/password");
+  Serial.println("  wifi remove <n> - remove saved network #n (see 'wifi list')");
+  Serial.println("  wifi status     - show connection status");
+  Serial.println("  wifi clear      - clear all saved networks");
 }
 
 void restartDevice(const char *message) {
@@ -99,19 +166,34 @@ void handleSerialLine(String line) {
       Serial.println("Password must be empty or contain 8-63 characters. Enter password:");
       return;
     }
-    if (!saveWiFiCredentials(pendingWifiSsid, line)) {
-      Serial.println("Failed to save Wi-Fi credentials to NVS");
+    if (!addWifiNetwork(pendingWifiSsid, line)) {
+      Serial.printf("Failed to save network to NVS (max %d reached?)\n", MAX_WIFI_NETWORKS);
       serialConfigState = SERIAL_COMMAND;
       return;
     }
-    restartDevice("Wi-Fi credentials saved. Restarting...");
+    restartDevice("Wi-Fi network saved. Restarting...");
     return;
   }
 
   line.trim();
-  if (line.equalsIgnoreCase("wifi config")) {
+  if (line.equalsIgnoreCase("wifi add")) {
     serialConfigState = SERIAL_WIFI_SSID;
     Serial.println("Enter SSID:");
+  } else if (line.startsWith("wifi remove")) {
+    String arg = line.substring(strlen("wifi remove"));
+    arg.trim();
+    if (arg.isEmpty()) {
+      Serial.println("Usage: wifi remove <n>  (see 'wifi list' for indices)");
+      return;
+    }
+    int index = arg.toInt();
+    if (removeWifiNetwork(index)) {
+      restartDevice("Wi-Fi network removed. Restarting...");
+    } else {
+      Serial.println("Invalid network index. Use 'wifi list' to see indices.");
+    }
+  } else if (line.equalsIgnoreCase("wifi list")) {
+    printWiFiStatus();
   } else if (line.equalsIgnoreCase("wifi status")) {
     printWiFiStatus();
   } else if (line.equalsIgnoreCase("wifi clear")) {
@@ -126,7 +208,7 @@ void handleSerialLine(String line) {
       Serial.println("Failed to clear Wi-Fi credentials");
       return;
     }
-    restartDevice("Wi-Fi credentials cleared. Restarting...");
+    restartDevice("Wi-Fi networks cleared. Restarting...");
   } else if (line.equalsIgnoreCase("help") || line.equalsIgnoreCase("wifi help")) {
     printSerialHelp();
   } else if (!line.isEmpty()) {
@@ -257,9 +339,13 @@ void setup() {
   //   s->set_framesize(s, FRAMESIZE_QVGA);
   // }
 
-  loadWiFiCredentials();
+  loadWifiNetworks();
+  if (wifiNetworkCount > 0) {
+    Serial.println("Saved Wi-Fi networks:");
+    printWifiNetworks();
+  }
 
-  // Connect to the configured local 2.4 GHz Wi-Fi network.
+  // Connect to the first reachable saved 2.4 GHz Wi-Fi network.
   WiFi.setSleep(false);
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
@@ -267,17 +353,19 @@ void setup() {
   WiFi.setHostname(hostname);
   WiFi.onEvent(handleWiFiEvent);
 
-  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
-  Serial.printf("Connecting to Wi-Fi %s", wifiSsid.c_str());
-  uint32_t connectStartedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - connectStartedAt < wifiConnectTimeoutMs) {
-    serviceSerialConfiguration();
-    delay(100);
+  for (int i = 0; i < wifiNetworkCount && WiFi.status() != WL_CONNECTED; i++) {
+    Serial.printf("Trying network [%d] %s...\n", i, wifiNetworks[i].ssid.c_str());
+    WiFi.begin(wifiNetworks[i].ssid.c_str(), wifiNetworks[i].password.c_str());
+    uint32_t connectStartedAt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - connectStartedAt < wifiConnectTimeoutMs) {
+      serviceSerialConfiguration();
+      delay(100);
+    }
   }
   Serial.println();
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Wi-Fi connection timed out; automatic reconnect remains enabled.");
-    Serial.println("Enter 'wifi config' to set different credentials.");
+    Serial.println("All saved networks failed; automatic reconnect remains enabled.");
+    Serial.println("Enter 'wifi add' to add a network.");
   }
 
   startCameraServer();

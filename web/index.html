@@ -16,6 +16,8 @@
     .status-panel{background:var(--panel);border:1px solid var(--line);align-self:start}.status-section{padding:15px 16px;border-bottom:1px solid var(--line)}.status-section:last-child{border-bottom:0}.section-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;color:var(--muted);font-size:10px;letter-spacing:.16em;text-transform:uppercase}.section-title strong{color:var(--text);font-size:12px;letter-spacing:.08em}
     .readout{display:grid;grid-template-columns:1fr 1fr;gap:11px 16px}.readout div{min-width:0}.readout dt{color:var(--muted);font-size:10px;letter-spacing:.09em;text-transform:uppercase}.readout dd{margin:3px 0 0;color:var(--text);font-size:14px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .camera-line{display:flex;justify-content:space-between;color:var(--muted);font-size:11px}.camera-line+.camera-line{margin-top:7px}.camera-line b{color:var(--text);font-weight:500}
+    .wifi-list{list-style:none;margin:0 0 10px;padding:0}.wifi-item{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:12px}.wifi-item:last-child{border-bottom:0}.wifi-item span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.wifi-current{color:var(--teal);font-style:normal;font-size:10px}.wifi-empty{color:var(--muted);font-size:11px;padding:4px 0}.mini-btn{padding:4px 8px;border:1px solid var(--line);background:var(--panel2);color:var(--muted);font-size:10px;letter-spacing:.08em;cursor:pointer}.mini-btn:hover{color:var(--text)}.mini-btn.danger{border-color:transparent;background:transparent;color:var(--danger)}.wifi-form{display:flex;gap:6px;margin-top:6px}.wifi-form input{flex:1;min-width:0;padding:7px 8px;border:1px solid var(--line);background:var(--panel);color:var(--text);outline:0}.wifi-form input:focus{border-color:var(--teal)}.wifi-form button{padding:7px 10px;border:1px solid var(--teal);background:var(--teal);color:#09211c;font-size:11px;font-weight:700;letter-spacing:.08em;cursor:pointer}.wifi-msg{min-height:14px;margin-top:7px;color:var(--muted);font-size:10px;letter-spacing:.06em}
+    @media(max-width:520px){.wifi-form{flex-wrap:wrap}.wifi-form input{flex:1 1 100%}}
     @media(max-width:980px){.topbar{flex-wrap:wrap}.connection{order:3;width:100%}.workspace{grid-template-columns:1fr;gap:12px;padding-top:15px}}
     @media(max-width:520px){.app{padding:12px 10px 22px}.endpoint{width:100%}.endpoint input{flex:1;width:auto}}
   </style>
@@ -34,7 +36,7 @@
           <div id="stream-state">CONNECT TO VIDEO</div>
           <div class="video-hud"><span class="live">LIVE</span><span id="frame-size">CAMERA</span></div>
         </div>
-        <div class="video-footer"><span id="ip">fpv-car.local</span><span>STREAM :81</span></div>
+        <div class="video-footer"><span id="ip">cam.local</span><span>STREAM :81</span></div>
       </section>
       <aside class="status-panel">
         <section class="status-section">
@@ -51,6 +53,16 @@
           <div class="camera-line"><span>Heap free</span><b id="heap">-</b></div>
           <div class="camera-line"><span>PSRAM free</span><b id="psram">-</b></div>
         </section>
+        <section class="status-section">
+          <div class="section-title"><strong>WiFi Networks</strong><button id="wifi-refresh" type="button" class="mini-btn">REFRESH</button></div>
+          <ul id="wifi-list" class="wifi-list"><li class="wifi-empty">-</li></ul>
+          <form id="wifi-form" class="wifi-form">
+            <input id="wifi-ssid" placeholder="SSID" spellcheck="false" autocomplete="off">
+            <input id="wifi-password" placeholder="Password" type="password" spellcheck="false" autocomplete="off">
+            <button type="submit">ADD</button>
+          </form>
+          <div id="wifi-msg" class="wifi-msg"></div>
+        </section>
       </aside>
     </main>
   </div>
@@ -59,7 +71,12 @@
     function normalize(value){try{const u=new URL(value.indexOf("://")<0?"http://"+value:value);u.pathname="";u.search="";u.hash="";return u.toString().replace(/\/$/,"")}catch{return null}}function streamUrl(){const u=new URL(baseUrl+"/stream");u.port="81";return u.toString()}function setConnection(online){$("connection-dot").classList.toggle("online",online);$("connection-text").textContent=online?"CONNECTED":"DISCONNECTED";$("vehicle-state").textContent=online?"ONLINE":"OFFLINE"}
     function formatUptime(ms){let s=Math.floor(ms/1000),h=Math.floor(s/3600);s%=3600;let m=Math.floor(s/60);s%=60;return[h,m,s].map(v=>String(v).padStart(2,"0")).join(":")}function kb(bytes){return bytes?Math.round(bytes/1024)+" KB":"-"}function renderStatus(d){setConnection(true);$("ip").textContent=d.ip||new URL(baseUrl).hostname;$("uptime").textContent=formatUptime(d.uptime_ms||0);$("signal").textContent=d.wifi_rssi!=null?d.wifi_rssi+" dBm":"-";$("heap").textContent=kb(d.free_heap);$("psram").textContent=kb(d.free_psram);$("camera-frame").textContent=d.framesize??"-";$("frame-size").textContent="F"+String(d.framesize??"-");$("camera-quality-value").textContent=d.quality??"-"}
     function refreshStatus(){fetch(api("/api/status"),{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("status unavailable");return r.json()}).then(renderStatus).catch(()=>setConnection(false))}function api(path){return baseUrl+path}
-    function connect(){const next=normalize(hostInput.value.trim());if(!next){setConnection(false);return}baseUrl=next;hostInput.value=next;localStorage.setItem("camera-esp32-host",next);stream.classList.remove("loaded");streamState.textContent="CONNECTING";stream.src=streamUrl();refreshStatus()}$("connect").addEventListener("click",connect);hostInput.addEventListener("keydown",e=>{if(e.key==="Enter")connect()});stream.addEventListener("load",()=>{stream.classList.add("loaded");streamState.textContent=""});stream.addEventListener("error",()=>{stream.classList.remove("loaded");streamState.textContent="VIDEO RECONNECTING"});connect();setInterval(refreshStatus,1000);
+    function connect(){const next=normalize(hostInput.value.trim());if(!next){setConnection(false);return}baseUrl=next;hostInput.value=next;localStorage.setItem("camera-esp32-host",next);stream.classList.remove("loaded");streamState.textContent="CONNECTING";stream.src=streamUrl();refreshStatus()}function renderWifiList(data){const list=$("wifi-list");list.innerHTML="";(data.networks||[]).forEach((n,i)=>{const li=document.createElement("li");li.className="wifi-item";const name=document.createElement("span");name.textContent=n.ssid;if(data.connected&&n.ssid===data.current){const cur=document.createElement("em");cur.className="wifi-current";cur.textContent=" · connected";name.appendChild(cur)}li.appendChild(name);const btn=document.createElement("button");btn.type="button";btn.className="mini-btn danger";btn.textContent="DEL";btn.onclick=()=>removeWifi(i);li.appendChild(btn);list.appendChild(li)});if(!data.networks||!data.networks.length){const li=document.createElement("li");li.className="wifi-empty";li.textContent="No saved networks";list.appendChild(li)}}
+    function loadWifiList(){fetch(api("/api/wifi"),{cache:"no-store"}).then(r=>{if(!r.ok)throw Error("wifi unavailable");return r.json()}).then(renderWifiList).catch(()=>{})}
+    function addWifi(e){e.preventDefault();const ssid=$("wifi-ssid").value.trim();if(!ssid)return;const password=$("wifi-password").value;$("wifi-msg").textContent="Saving...";fetch(api("/api/wifi?ssid="+encodeURIComponent(ssid)+"&password="+encodeURIComponent(password)),{method:"POST"}).then(r=>r.json()).then(()=>{$("wifi-msg").textContent="Saved, restarting..."}).catch(()=>{$("wifi-msg").textContent="Failed to save"})}
+    function removeWifi(index){$("wifi-msg").textContent="Removing...";fetch(api("/api/wifi?index="+index),{method:"DELETE"}).then(r=>r.json()).then(()=>{$("wifi-msg").textContent="Removed, restarting..."}).catch(()=>{$("wifi-msg").textContent="Failed to remove"})}
+    $("wifi-form").addEventListener("submit",addWifi);$("wifi-refresh").addEventListener("click",loadWifiList);
+    $("connect").addEventListener("click",connect);hostInput.addEventListener("keydown",e=>{if(e.key==="Enter")connect()});stream.addEventListener("load",()=>{stream.classList.add("loaded");streamState.textContent=""});stream.addEventListener("error",()=>{stream.classList.remove("loaded");streamState.textContent="VIDEO RECONNECTING"});connect();setInterval(refreshStatus,1000);setInterval(loadWifiList,3000);
   </script>
 </body>
 </html>

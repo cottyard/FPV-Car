@@ -8,6 +8,18 @@
 extern bool cameraAvailable;
 
 typedef struct {
+  String ssid;
+  String password;
+} WifiNetwork;
+
+#define MAX_WIFI_NETWORKS 8
+extern WifiNetwork wifiNetworks[];
+extern int wifiNetworkCount;
+extern bool addWifiNetwork(const String &ssid, const String &password);
+extern bool removeWifiNetwork(int index);
+extern const char *hostname;
+
+typedef struct {
     size_t size;
     size_t index;
     size_t count;
@@ -203,12 +215,12 @@ static esp_err_t status_handler(httpd_req_t *req) {
     char response[640];
     String ip = WiFi.localIP().toString();
     snprintf(response, sizeof(response),
-             "{\"ip\":\"%s\",\"hostname\":\"fpv-car.local\",\"uptime_ms\":%lu,"
+             "{\"ip\":\"%s\",\"hostname\":\"%s.local\",\"uptime_ms\":%lu,"
              "\"free_heap\":%lu,\"psram_size\":%lu,\"free_psram\":%lu,\"wifi_rssi\":%d,"
              "\"cpu_mhz\":%u,"
              "\"camera_available\":%s,\"framesize\":%d,\"quality\":%d,"
              "\"brightness\":%d,\"contrast\":%d,\"saturation\":%d}",
-             ip.c_str(), (unsigned long)millis(), (unsigned long)ESP.getFreeHeap(),
+             ip.c_str(), hostname, (unsigned long)millis(), (unsigned long)ESP.getFreeHeap(),
              (unsigned long)ESP.getPsramSize(), (unsigned long)ESP.getFreePsram(), WiFi.RSSI(),
              (unsigned int)ESP.getCpuFreqMHz(), sensor ? "true" : "false", framesize, quality,
              brightness, contrast, saturation);
@@ -216,6 +228,80 @@ static esp_err_t status_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/json");
     set_cors(req);
     return httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t wifi_list_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    String body = "{\"connected\":";
+    body += (WiFi.status() == WL_CONNECTED) ? "true" : "false";
+    body += ",\"rssi\":" + String(WiFi.RSSI());
+    body += ",\"current\":\"";
+    body += (WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : String("");
+    body += "\",\"max\":" + String(MAX_WIFI_NETWORKS);
+    body += ",\"networks\":[";
+    for (int i = 0; i < wifiNetworkCount; i++) {
+        if (i > 0) {
+            body += ",";
+        }
+        body += "{\"ssid\":\"" + wifiNetworks[i].ssid + "\"}";
+    }
+    body += "]}";
+    return httpd_resp_send(req, body.c_str(), HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t wifi_add_handler(httpd_req_t *req) {
+    char query[256] = {0};
+    char ssid[33] = {0};
+    char password[64] = {0};
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len == 0 || query_len >= sizeof(query) ||
+        httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "ssid", ssid, sizeof(ssid)) != ESP_OK ||
+        ssid[0] == '\0') {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected ssid");
+    }
+    httpd_query_key_value(query, "password", password, sizeof(password));
+    if (!addWifiNetwork(ssid, password)) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to save (max reached?)");
+    }
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    httpd_resp_sendstr(req, "{\"saved\":true}");
+    Serial.printf("WiFi network added via web: %s\n", ssid);
+    delay(300);
+    ESP.restart();
+    return ESP_OK;
+}
+
+static esp_err_t wifi_remove_handler(httpd_req_t *req) {
+    char query[128] = {0};
+    char index_str[8] = {0};
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len == 0 || query_len >= sizeof(query) ||
+        httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "index", index_str, sizeof(index_str)) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected index");
+    }
+    int index = atoi(index_str);
+    if (!removeWifiNetwork(index)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid index");
+    }
+    httpd_resp_set_type(req, "application/json");
+    set_cors(req);
+    httpd_resp_sendstr(req, "{\"removed\":true}");
+    Serial.printf("WiFi network removed via web: index %d\n", index);
+    delay(300);
+    ESP.restart();
+    return ESP_OK;
+}
+
+static esp_err_t wifi_options_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    httpd_resp_set_hdr(req, "Access-Control-Max-Age", "600");
+    return httpd_resp_send(req, NULL, 0);
 }
 
 static void register_uri(httpd_handle_t server, httpd_uri_t *uri) {
@@ -234,10 +320,18 @@ void startCameraServer() {
     httpd_uri_t status_uri = {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL};
     httpd_uri_t camera_uri = {.uri = "/api/camera", .method = HTTP_GET, .handler = camera_control_handler, .user_ctx = NULL};
     httpd_uri_t capture_uri = {.uri = "/api/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL};
+    httpd_uri_t wifi_list_uri = {.uri = "/api/wifi", .method = HTTP_GET, .handler = wifi_list_handler, .user_ctx = NULL};
+    httpd_uri_t wifi_add_uri = {.uri = "/api/wifi", .method = HTTP_POST, .handler = wifi_add_handler, .user_ctx = NULL};
+    httpd_uri_t wifi_remove_uri = {.uri = "/api/wifi", .method = HTTP_DELETE, .handler = wifi_remove_handler, .user_ctx = NULL};
+    httpd_uri_t wifi_options_uri = {.uri = "/api/wifi", .method = HTTP_OPTIONS, .handler = wifi_options_handler, .user_ctx = NULL};
 
     Serial.printf("Starting API server on port %d\n", api_config.server_port);
     if (httpd_start(&api_httpd, &api_config) == ESP_OK) {
         register_uri(api_httpd, &status_uri);
+        register_uri(api_httpd, &wifi_list_uri);
+        register_uri(api_httpd, &wifi_add_uri);
+        register_uri(api_httpd, &wifi_remove_uri);
+        register_uri(api_httpd, &wifi_options_uri);
         if (cameraAvailable) {
             register_uri(api_httpd, &camera_uri);
             register_uri(api_httpd, &capture_uri);

@@ -5,8 +5,8 @@ import serial
 
 PORT = "COM3"
 BAUD = 115200
-SSID = "fhjqr"
-PASSWORD = "12345678"
+DEFAULT_SSID = "fhjqr"
+DEFAULT_PASSWORD = "12345678"
 TIMEOUT_S = 20  # seconds to wait for each prompt
 
 
@@ -35,26 +35,27 @@ def send(ser, line):
 
 
 def main():
-    if len(sys.argv) > 1:
-        PORT = sys.argv[1]
-    ser = serial.Serial(PORT, BAUD, timeout=0.3)
+    port = sys.argv[1] if len(sys.argv) > 1 else PORT
+    ssid = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_SSID
+    password = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_PASSWORD
+    ser = serial.Serial(port, BAUD, timeout=0.3)
     # Open without resetting the chip (do not pulse EN).
     ser.dtr = False
     ser.rts = False
     time.sleep(0.5)
     ser.reset_input_buffer()
-    print("==> configuring WiFi %s on %s" % (SSID, PORT))
+    print("==> adding WiFi %s on %s" % (ssid, port))
 
-    send(ser, "wifi config")
+    send(ser, "wifi add")
     if not wait_for(ser, "Enter SSID:"):
         ser.close()
         return 1
-    send(ser, SSID)
+    send(ser, ssid)
     if not wait_for(ser, "Enter password"):
         ser.close()
         return 1
-    send(ser, PASSWORD)
-    # Device saves credentials and restarts.
+    send(ser, password)
+    # Device saves the network and restarts.
     wait_for(ser, "Restarting", 10)
     ser.close()
     print("==> done")
