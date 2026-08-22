@@ -2,39 +2,17 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <ArduinoOTA.h>
+#include "camera_pins.h"
 
-#define PWDN_GPIO_NUM  -1
-#define RESET_GPIO_NUM -1
-#define XCLK_GPIO_NUM  10
-#define SIOD_GPIO_NUM  40
-#define SIOC_GPIO_NUM  39
-
-#define Y9_GPIO_NUM    48
-#define Y8_GPIO_NUM    11
-#define Y7_GPIO_NUM    12
-#define Y6_GPIO_NUM    14
-#define Y5_GPIO_NUM    16
-#define Y4_GPIO_NUM    18
-#define Y3_GPIO_NUM    17
-#define Y2_GPIO_NUM    15
-#define VSYNC_GPIO_NUM 38
-#define HREF_GPIO_NUM  47
-#define PCLK_GPIO_NUM  13
-
-const char *defaultSsid = "Redmi_0DAC";
-const char *defaultPassword = "16716811";
+// Firmware defaults are only a fallback; the working credentials are read from
+// NVS (see loadWiFiCredentials). Configure them with the 'wifi config' command.
+const char *defaultSsid = "fhjqr";
+const char *defaultPassword = "12345678";
 const char *hostname = "fpv-car";
 const char *preferencesNamespace = "fpv-wifi";
 const uint32_t wifiConnectTimeoutMs = 20000;
 
-// GPIO Setting
-// Change according to your setup
-int gpLb = D1; // Left 1
-int gpLf = D2; // Left 2
-int gpRb = D3; // Right 1
-int gpRf = D4; // Right 2
-int gpLed = D9; // Light
-int gpGND = D8; // Light
 String WiFiAddr;
 String wifiSsid;
 String wifiPassword;
@@ -53,10 +31,7 @@ bool wifiWasConnected = false;
 bool cameraAvailable = false;
 
 void startCameraServer();
-void serviceDriveWatchdog();
 void serviceSerialConfiguration();
-void WheelAct(int nLf, int nLb, int nRf, int nRb);
-// void setupLedFlash(int pin);
 
 void loadWiFiCredentials() {
   Preferences preferences;
@@ -97,59 +72,6 @@ void printSerialHelp() {
   Serial.println("  wifi config  - enter and save a new SSID/password");
   Serial.println("  wifi status  - show the current SSID and connection status");
   Serial.println("  wifi clear   - restore firmware-default credentials");
-  Serial.println("Motor diagnostic commands:");
-  Serial.println("  motor pins             - print the configured motor GPIOs");
-  Serial.println("  motor left|right [pwm] [ms] - run one side (default 100 PWM, 500 ms)");
-  Serial.println("  motor lf|lb|rf|rb [pwm] [ms] - run one H-bridge input (max 10000 ms)");
-  Serial.println("  motor stop             - stop all motor outputs");
-}
-
-void stopSerialMotorTest() {
-  WheelAct(0, 0, 0, 0);
-}
-
-void runSerialMotorTest(const String &arguments) {
-  char target[16] = {0};
-  int pwm = 100;
-  int duration = 500;
-  int parsed = sscanf(arguments.c_str(), "%15s %d %d", target, &pwm, &duration);
-
-  if (parsed < 1 || !strcmp(target, "help")) {
-    Serial.println("Usage: motor pins | motor left|right|lf|lb|rf|rb [pwm 0-255] [ms 1-10000]");
-    return;
-  }
-  if (!strcmp(target, "pins")) {
-    Serial.printf("Motor GPIOs: LF=%d LB=%d RF=%d RB=%d\n", gpLf, gpLb, gpRf, gpRb);
-    return;
-  }
-  if (!strcmp(target, "stop")) {
-    stopSerialMotorTest();
-    Serial.println("Motor outputs stopped");
-    return;
-  }
-  if (strcmp(target, "left") && strcmp(target, "right") &&
-      strcmp(target, "lf") && strcmp(target, "lb") &&
-      strcmp(target, "rf") && strcmp(target, "rb")) {
-    Serial.println("Unknown motor target. Use 'motor help'.");
-    return;
-  }
-
-  pwm = constrain(pwm, 0, 255);
-  duration = constrain(duration, 1, 10000);
-  int lf = 0;
-  int lb = 0;
-  int rf = 0;
-  int rb = 0;
-  if (!strcmp(target, "left") || !strcmp(target, "lf")) lf = pwm;
-  if (!strcmp(target, "lb")) lb = pwm;
-  if (!strcmp(target, "right") || !strcmp(target, "rf")) rf = pwm;
-  if (!strcmp(target, "rb")) rb = pwm;
-
-  Serial.printf("Testing %s: PWM=%d for %d ms\n", target, pwm, duration);
-  WheelAct(lf, lb, rf, rb);
-  delay(duration);
-  stopSerialMotorTest();
-  Serial.println("Motor test complete; outputs stopped");
 }
 
 void restartDevice(const char *message) {
@@ -207,10 +129,6 @@ void handleSerialLine(String line) {
     restartDevice("Wi-Fi credentials cleared. Restarting...");
   } else if (line.equalsIgnoreCase("help") || line.equalsIgnoreCase("wifi help")) {
     printSerialHelp();
-  } else if (line.startsWith("motor") && (line.length() == 5 || line.charAt(5) == ' ')) {
-    String arguments = line.substring(5);
-    arguments.trim();
-    runSerialMotorTest(arguments);
   } else if (!line.isEmpty()) {
     Serial.println("Unknown command. Enter 'wifi help' for available commands.");
   }
@@ -255,6 +173,16 @@ void handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
     Serial.printf("Wi-Fi connected, IP=%s\n", WiFi.localIP().toString().c_str());
   }
+}
+
+void setupOTA() {
+  ArduinoOTA.setHostname(hostname);
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA: update started");
+  });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA: done"); });
+  ArduinoOTA.begin();
+  Serial.println("OTA ready (WiFi-updatable)");
 }
 
 void setup() {
@@ -354,12 +282,12 @@ void setup() {
 
   startCameraServer();
   serviceNetworkStatus();
+  setupOTA();
 }
 
 void loop() {
+  ArduinoOTA.handle();
   serviceSerialConfiguration();
   serviceNetworkStatus();
-  serviceDriveWatchdog();
   delay(20);
 }
-

@@ -5,16 +5,7 @@
 #include "Arduino.h"
 #include <WiFi.h>
 
-extern int gpLb;
-extern int gpLf;
-extern int gpRb;
-extern int gpRf;
-extern int gpLed;
-extern int gpGND;
 extern bool cameraAvailable;
-
-void WheelAct(int nLf, int nLb, int nRf, int nRb);
-void LEDAct(int value);
 
 typedef struct {
     size_t size;
@@ -34,16 +25,9 @@ static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" 
 static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
-static const int DEFAULT_SPEED = 45;
-static const uint32_t DRIVE_TIMEOUT_MS = 900;
-
 static ra_filter_t ra_filter;
 static httpd_handle_t stream_httpd = NULL;
 static httpd_handle_t api_httpd = NULL;
-static volatile uint32_t last_drive_at = 0;
-static String active_motion = "STOP";
-static int active_speed = 0;
-static bool light_enabled = false;
 
 static void set_cors(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -216,108 +200,22 @@ static esp_err_t status_handler(httpd_req_t *req) {
     int contrast = sensor ? sensor->status.contrast : 0;
     int saturation = sensor ? sensor->status.saturation : 0;
 
-    char response[768];
+    char response[640];
     String ip = WiFi.localIP().toString();
     snprintf(response, sizeof(response),
              "{\"ip\":\"%s\",\"hostname\":\"fpv-car.local\",\"uptime_ms\":%lu,"
              "\"free_heap\":%lu,\"psram_size\":%lu,\"free_psram\":%lu,\"wifi_rssi\":%d,"
-             "\"motion\":\"%s\",\"speed\":%d,\"light\":%s,\"cpu_mhz\":%u,"
+             "\"cpu_mhz\":%u,"
              "\"camera_available\":%s,\"framesize\":%d,\"quality\":%d,"
              "\"brightness\":%d,\"contrast\":%d,\"saturation\":%d}",
              ip.c_str(), (unsigned long)millis(), (unsigned long)ESP.getFreeHeap(),
              (unsigned long)ESP.getPsramSize(), (unsigned long)ESP.getFreePsram(), WiFi.RSSI(),
-             active_motion.c_str(), active_speed, light_enabled ? "true" : "false",
              (unsigned int)ESP.getCpuFreqMHz(), sensor ? "true" : "false", framesize, quality,
              brightness, contrast, saturation);
 
     httpd_resp_set_type(req, "application/json");
     set_cors(req);
     return httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
-}
-
-static void stop_motion() {
-    WheelAct(0, 0, 0, 0);
-    active_motion = "STOP";
-    active_speed = 0;
-    last_drive_at = 0;
-}
-
-static bool set_motion(const char *direction, int speed) {
-    speed = constrain(speed, 0, 255);
-    if (!strcmp(direction, "forward")) {
-        WheelAct(speed, 0, 0, speed);
-        active_motion = "FORWARD";
-    } else if (!strcmp(direction, "back")) {
-        WheelAct(0, speed, speed, 0);
-        active_motion = "BACK";
-    } else if (!strcmp(direction, "left")) {
-        WheelAct(0, speed, 0, speed);
-        active_motion = "LEFT";
-    } else if (!strcmp(direction, "right")) {
-        WheelAct(speed, 0, speed, 0);
-        active_motion = "RIGHT";
-    } else if (!strcmp(direction, "stop")) {
-        stop_motion();
-        return true;
-    } else {
-        return false;
-    }
-    active_speed = speed;
-    last_drive_at = millis();
-    return true;
-}
-
-static esp_err_t drive_handler(httpd_req_t *req) {
-    char query[128] = {0};
-    char direction[20] = {0};
-    char speed_text[8] = {0};
-    size_t query_len = httpd_req_get_url_query_len(req);
-    if (query_len == 0 || query_len >= sizeof(query) ||
-        httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
-        httpd_query_key_value(query, "dir", direction, sizeof(direction)) != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing dir");
-    }
-
-    int speed = DEFAULT_SPEED;
-    if (httpd_query_key_value(query, "speed", speed_text, sizeof(speed_text)) == ESP_OK) {
-        speed = constrain(atoi(speed_text), 0, 255);
-    }
-    if (!set_motion(direction, speed)) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid dir");
-    }
-
-    char response[96];
-    snprintf(response, sizeof(response), "{\"ok\":true,\"motion\":\"%s\",\"speed\":%d}",
-             active_motion.c_str(), active_speed);
-    httpd_resp_set_type(req, "application/json");
-    set_cors(req);
-    return httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
-}
-
-static esp_err_t light_handler(httpd_req_t *req) {
-    char query[32] = {0};
-    char value[8] = {0};
-    size_t query_len = httpd_req_get_url_query_len(req);
-    if (query_len == 0 || query_len >= sizeof(query) ||
-        httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
-        httpd_query_key_value(query, "on", value, sizeof(value)) != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing on");
-    }
-
-    light_enabled = atoi(value) != 0;
-    LEDAct(light_enabled ? 110 : 0);
-    httpd_resp_set_type(req, "application/json");
-    set_cors(req);
-    return httpd_resp_send(req,
-        light_enabled ? "{\"ok\":true,\"light\":true}" : "{\"ok\":true,\"light\":false}",
-        HTTPD_RESP_USE_STRLEN);
-}
-
-void serviceDriveWatchdog() {
-    if (last_drive_at != 0 && millis() - last_drive_at > DRIVE_TIMEOUT_MS) {
-        stop_motion();
-        Serial.println("Drive timeout - Stop");
-    }
 }
 
 static void register_uri(httpd_handle_t server, httpd_uri_t *uri) {
@@ -334,16 +232,12 @@ void startCameraServer() {
     api_config.max_uri_handlers = 8;
 
     httpd_uri_t status_uri = {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL};
-    httpd_uri_t drive_uri = {.uri = "/api/drive", .method = HTTP_GET, .handler = drive_handler, .user_ctx = NULL};
-    httpd_uri_t light_uri = {.uri = "/api/light", .method = HTTP_GET, .handler = light_handler, .user_ctx = NULL};
     httpd_uri_t camera_uri = {.uri = "/api/camera", .method = HTTP_GET, .handler = camera_control_handler, .user_ctx = NULL};
     httpd_uri_t capture_uri = {.uri = "/api/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL};
 
     Serial.printf("Starting API server on port %d\n", api_config.server_port);
     if (httpd_start(&api_httpd, &api_config) == ESP_OK) {
         register_uri(api_httpd, &status_uri);
-        register_uri(api_httpd, &drive_uri);
-        register_uri(api_httpd, &light_uri);
         if (cameraAvailable) {
             register_uri(api_httpd, &camera_uri);
             register_uri(api_httpd, &capture_uri);
@@ -363,16 +257,4 @@ void startCameraServer() {
     } else {
         Serial.println("Camera unavailable; stream server disabled");
     }
-}
-
-void WheelAct(int nLf, int nLb, int nRf, int nRb) {
-    analogWrite(gpLf, nLf);
-    analogWrite(gpLb, nLb);
-    analogWrite(gpRf, nRf);
-    analogWrite(gpRb, nRb);
-}
-
-void LEDAct(int value) {
-    analogWrite(gpLed, value);
-    analogWrite(gpGND, 0);
 }
