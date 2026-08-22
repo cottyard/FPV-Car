@@ -1,4 +1,12 @@
-<!doctype html>
+#pragma once
+
+// Control web page embedded into the firmware so the tank serves its own UI at
+// the root URL instead of returning "Not found". Keep this in sync with the
+// standalone PC copy at ../tank.html.
+
+namespace {
+
+constexpr char INDEX_HTML[] = R"INDEX_HTML(<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -82,15 +90,13 @@
     const $=id=>document.getElementById(id),hostInput=$("host"),speed=$("speed");
     const savedHost=localStorage.getItem("tank-esp32-host");let baseUrl=savedHost||hostInput.value;
     hostInput.value=baseUrl;
-    // 轨道命令：l/r 分别为左/右履带，f 前进、r 后退、0 停止
     const dirToTracks={forward:{l:"f",r:"f"},back:{l:"r",r:"r"},left:{l:"r",r:"f"},right:{l:"f",r:"r"}};
-    // 键盘：方向键整体控制，Q/A 左履带 前进/后退，W/S 右履带 前进/后退
     const keyCommands={ArrowUp:dirToTracks.forward,ArrowDown:dirToTracks.back,ArrowLeft:dirToTracks.left,ArrowRight:dirToTracks.right,q:{l:"f",r:"0"},a:{l:"r",r:"0"},w:{l:"0",r:"f"},s:{l:"0",r:"r"}};
-    const held=new Map(); // 当前按住的来源(键名/按钮) -> 轨道命令，支持多条履带同时操作
+    const held=new Map();
     let heartbeat=null;
-    let pinsLoaded=false; // 引脚输入框只在每次连接时填充一次，避免刷新覆盖用户编辑
-    let driveInFlight=false; // 同一时刻只保留一个在途的控制请求，避免请求堆积
-    let consecutiveFails=0;  // 连续失败去抖，避免轻微丢包就翻成 DISCONNECTED
+    let pinsLoaded=false;
+    let driveInFlight=false;
+    let consecutiveFails=0;
     function normalize(value){try{const u=new URL(value.indexOf("://")<0?"http://"+value:value);u.pathname="";u.search="";u.hash="";return u.toString().replace(/\/$/,"")}catch{return null}}
     function api(path){return baseUrl+path}
     function setConnection(online){$("connection-dot").classList.toggle("online",online);$("connection-text").textContent=online?"CONNECTED":"DISCONNECTED";$("vehicle-state").textContent=online?"ONLINE":"OFFLINE"}
@@ -119,3 +125,6 @@
   </script>
 </body>
 </html>
+)INDEX_HTML";
+
+}  // namespace

@@ -3,13 +3,15 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <ArduinoOTA.h>
 #include "pins.h"
+#include "index_html.h"
 
 namespace {
 
 constexpr char HOSTNAME[] = "esp32-tank";
-constexpr char DEFAULT_SSID[] = "Redmi_0DAC";
-constexpr char DEFAULT_PASSWORD[] = "16716811";
+constexpr char DEFAULT_SSID[] = "fhjqr";
+constexpr char DEFAULT_PASSWORD[] = "12345678";
 constexpr char WIFI_NS[] = "tank-wifi";
 constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 constexpr uint32_t DRIVE_TIMEOUT_MS = 350;
@@ -28,6 +30,12 @@ Preferences preferences;
 String wifiSsid = DEFAULT_SSID;
 String wifiPassword = DEFAULT_PASSWORD;
 bool apFallbackActive = false;
+
+// Runtime diagnostics: help tell apart a full reset (power sag) from a plain
+// WiFi radio drop (motor EMI) without needing a serial connection.
+static constexpr char DIAG_NS[] = "tank-diag";
+static uint32_t rebootCount = 0;
+static uint32_t wifiDropCount = 0;
 
 // Motor pin configuration, kept in NVS so it can be changed without reflashing.
 constexpr char PIN_NS[] = "tank-pins";
@@ -124,13 +132,13 @@ void setupMotors() {
 // Motor pin configuration (NVS, no reflashing required)
 // ---------------------------------------------------------------------------
 
-// GPIOs safe as outputs on this module (avoids UART0 1/3, strapping 0/2/4/5/12/15
-// on some modules, flash 6-11, and input-only 34-39). Pins must differ from each other.
+// GPIOs usable as motor outputs. Wired pins that the ROM bootloader drives in
+// download mode (UART0 1/3) are excluded. Pins must differ from each other.
 bool isValidPin(uint8_t pin) {
   static const bool usable[40] = {
     /*0*/false, /*1*/false, /*2*/false, /*3*/false, /*4*/false, /*5*/false,
     /*6*/false, /*7*/false, /*8*/false, /*9*/false, /*10*/false, /*11*/false,
-    /*12*/false, /*13*/false, /*14*/false, /*15*/false, /*16*/true, /*17*/true,
+    /*12*/true, /*13*/true, /*14*/true, /*15*/true, /*16*/true, /*17*/true,
     /*18*/true, /*19*/true, /*20*/false, /*21*/false, /*22*/true, /*23*/true,
     /*24*/false, /*25*/true, /*26*/true, /*27*/true, /*28*/false, /*29*/false,
     /*30*/false, /*31*/false, /*32*/true, /*33*/true, /*34*/false, /*35*/false,
@@ -150,7 +158,7 @@ bool arePinsValid(const PinConfig& config) {
   return true;
 }
 
-// Default pins (16/17/15/14) are all usable, so the config is always valid when empty.
+// Default pins (14/15/12/13) are all usable, so the config is always valid when empty.
 void loadPinConfig() {
   if (!preferences.begin(PIN_NS, true)) return;
   pinCfg.leftForward = preferences.getUChar("lf", LEFT_FORWARD_PIN);
@@ -206,6 +214,22 @@ bool clearWiFiCredentials() {
   bool cleared = preferences.clear();
   preferences.end();
   return cleared;
+}
+
+// Count boots across resets (persisted in NVS) and listen for STA disconnects.
+void loadRebootCount() {
+  if (!preferences.begin(DIAG_NS, false)) {
+    return;
+  }
+  rebootCount = preferences.getUInt("boots", 0) + 1;
+  preferences.putUInt("boots", rebootCount);
+  preferences.end();
+}
+
+void onWiFiEvent(WiFiEvent_t event) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    wifiDropCount++;
+  }
 }
 
 void printWiFiStatus() {
@@ -297,8 +321,14 @@ void serviceSerialConfiguration() {
 }
 
 // ---------------------------------------------------------------------------
-// Web server: light control API only, no embedded web page (page lives on PC)
+// Web server: light control API plus the embedded web page (served at "/")
 // ---------------------------------------------------------------------------
+
+void handleRoot() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html", INDEX_HTML);
+}
 
 void sendPins() {
   char body[128];
@@ -343,14 +373,16 @@ void handlePins() {
 
 void sendStatus() {
   String ip = apFallbackActive ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
-  char body[256];
+  char body[384];
   snprintf(body, sizeof(body),
            "{\"speed\":%u,\"motion\":\"%s\",\"left\":%d,\"right\":%d,"
            "\"wifi_mode\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d,"
+           "\"uptime_s\":%u,\"reboots\":%u,\"wifi_drops\":%u,"
            "\"pins\":{\"left_forward\":%u,\"left_reverse\":%u,"
            "\"right_forward\":%u,\"right_reverse\":%u}}",
            speedSetting, motionName(), leftDirection, rightDirection,
            apFallbackActive ? "ap" : "sta", wifiSsid.c_str(), ip.c_str(), WiFi.RSSI(),
+           (uint32_t)(millis() / 1000), rebootCount, wifiDropCount,
            pinCfg.leftForward, pinCfg.leftReverse, pinCfg.rightForward, pinCfg.rightReverse);
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Cache-Control", "no-store");
@@ -414,6 +446,7 @@ void setup() {
   Serial.println("ESP32 Tank - enter 'wifi help' for Wi-Fi configuration commands.");
 
   loadPinConfig();
+  loadRebootCount();
 
   setupMotors();
 
@@ -424,6 +457,7 @@ void setup() {
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.setHostname(HOSTNAME);
+  WiFi.onEvent(onWiFiEvent);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   Serial.printf("Connecting to Wi-Fi %s", wifiSsid.c_str());
   uint32_t connectStartedAt = millis();
@@ -448,17 +482,32 @@ void setup() {
   MDNS.begin(HOSTNAME);
   MDNS.addService("http", "tcp", 80);
 
+  server.on("/", HTTP_GET, handleRoot);
   server.on("/api/control", HTTP_GET, handleControl);
   server.on("/api/status", HTTP_GET, sendStatus);
   server.on("/api/wifi", HTTP_GET, handleWifi);
   server.on("/api/pins", HTTP_GET, handlePins);
   server.begin();
 
+  setupOTA();
+
   Serial.printf("Web API ready at http://%s.local/ (mDNS)\n", HOSTNAME);
   printWiFiStatus();
 }
 
+void setupOTA() {
+  ArduinoOTA.setHostname(HOSTNAME);
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA: update started");
+    stopMotors();
+  });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA: done"); });
+  ArduinoOTA.begin();
+  Serial.println("OTA ready (WiFi-updatable)");
+}
+
 void loop() {
+  ArduinoOTA.handle();
   serviceSerialConfiguration();
   server.handleClient();
   uint32_t now = millis();
